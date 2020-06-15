@@ -38,7 +38,11 @@ func (T *Conn) closeNotify(err error) {
 		return
 	default:
 	}
-	if neterr, ok := err.(net.Error); ok && neterr.Timeout() || err == io.EOF {
+	if(err == io.EOF){
+		T.closed <- true
+		return
+	}
+	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 		T.closed <- true
 		return
 	}
@@ -150,7 +154,6 @@ func (T *connReader) backgroundRead() {
 	T.inRead = false
 	T.unlock()
 	T.cond.Broadcast()
-	
 }
 //中止等待读取
 func (T *connReader) abortPendingRead() {
@@ -187,6 +190,7 @@ func (T *connReader) Read(p []byte) (n int, err error) {
 		T.unlock()
 		return 1, nil
 	}
+
 	T.inRead = true
 	T.unlock()
 	n, err = T.conn.rwc.Read(p)
