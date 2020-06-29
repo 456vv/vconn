@@ -6,14 +6,13 @@ import(
 	"sync"
 	"io"
 )
-
 type CloseNotifier interface {
-    CloseNotify() <-chan bool
+    CloseNotify() <-chan error
 }
 
 type Conn struct {
 	rwc		net.Conn
-	closed 	chan bool
+	closed 	chan error
 	r		*connReader
 	readDeadline	time.Time
 	m		sync.Mutex
@@ -23,37 +22,31 @@ func NewConn(c net.Conn) net.Conn {
 		return conn
 	}
 	
-	conn := &Conn{rwc:c, closed:make(chan bool, 1)}
+	conn := &Conn{rwc:c, closed:make(chan error, 1)}
 	conn.r = &connReader{conn:conn}
-	conn.r.startBackgroundRead()
 	return conn
 }
-func (T *Conn) CloseNotify() <-chan bool {
+func (T *Conn) CloseNotify() <-chan error {
+	T.r.startBackgroundRead()
 	return T.closed
 }
 
 func (T *Conn) closeNotify(err error) {
 	select{
 	case <-T.closed:
-		return
 	default:
 	}
-	if(err == io.EOF){
-		T.closed <- true
+	if err == io.EOF {
+		T.closed <- err
+		return
+	}else if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+		T.closed <- err
+		return
+	} else if oe, ok := err.(*net.OpError); ok && (oe.Op == "read" || oe.Op == "write") {
+		T.closed <- err
 		return
 	}
-	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
-		T.closed <- true
-		return
-	}
-	if oe, ok := err.(*net.OpError); ok && (oe.Op == "read" || oe.Op == "write") {
-		T.closed <- true
-		return
-	}
-
-	T.r.startBackgroundRead()
 }
-
 
 func (T *Conn) Read(b []byte) (n int, err error) {
 	T.r.abortPendingRead()
@@ -61,13 +54,11 @@ func (T *Conn) Read(b []byte) (n int, err error) {
 	T.closeNotify(err)
 	return
 }
-
 func (T *Conn) Write(b []byte) (n int, err error) {
 	n, err = T.rwc.Write(b)
 	T.closeNotify(err)
 	return
 }
-
 func (T *Conn) Close() error {
 	T.m.Lock()
 	defer T.m.Unlock()
@@ -99,9 +90,6 @@ func (T *Conn) SetWriteDeadline(t time.Time) error {
 	return T.rwc.SetWriteDeadline(t)
 }
 
-
-
-
 type connReader struct {
   	conn 	*Conn															// 上级
   	                            											
@@ -123,6 +111,7 @@ func (T *connReader) lock() {
 
 //解锁
 func (T *connReader) unlock() {T.mu.Unlock()}
+
 //开始后台读取
 func (T *connReader) startBackgroundRead() {
 	T.lock()
@@ -137,6 +126,7 @@ func (T *connReader) startBackgroundRead() {
   	T.conn.rwc.SetReadDeadline(time.Time{})
   	go T.backgroundRead()
 }
+
 //后台读取
 func (T *connReader) backgroundRead() {
 	n, err := T.conn.rwc.Read(T.byteBuf[:])
@@ -155,6 +145,7 @@ func (T *connReader) backgroundRead() {
 	T.unlock()
 	T.cond.Broadcast()
 }
+
 //中止等待读取
 func (T *connReader) abortPendingRead() {
 	T.lock()
@@ -169,7 +160,6 @@ func (T *connReader) abortPendingRead() {
 	}
 	T.conn.rwc.SetReadDeadline(T.conn.readDeadline)
 }
-
 
 //读取数据
 func (T *connReader) Read(p []byte) (n int, err error) {
