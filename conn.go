@@ -5,49 +5,56 @@ import(
 	"time"
 	"sync"
 	"io"
+	"sync/atomic"
 )
+type atomicBool int32
+func (T *atomicBool) isTrue() bool 	{ return atomic.LoadInt32((*int32)(T)) != 0 }
+func (T *atomicBool) isFalse() bool	{ return atomic.LoadInt32((*int32)(T)) != 1 }
+func (T *atomicBool) setTrue() bool	{ return !atomic.CompareAndSwapInt32((*int32)(T), 0, 1)}
+func (T *atomicBool) setFalse() bool{ return atomic.CompareAndSwapInt32((*int32)(T), 1, 0)}
+
 type CloseNotifier interface {
     CloseNotify() <-chan error
 }
 
 type Conn struct {
-	rwc		net.Conn
-	closed 	chan error
-	r		*connReader
+	rwc				net.Conn
+	closedSignal 	chan error
+	r				*connReader
 	readDeadline	time.Time
-	m		sync.Mutex
+	m				sync.Mutex
+	closed		atomicBool
 }
 func NewConn(c net.Conn) net.Conn {
 	if conn, ok := c.(*Conn); ok {
 		return conn
 	}
-	
-	conn := &Conn{rwc:c, closed:make(chan error, 1)}
+	conn := &Conn{rwc:c, closedSignal:make(chan error, 1)}
 	conn.r = &connReader{conn:conn}
 	return conn
 }
 func (T *Conn) CloseNotify() <-chan error {
-	T.r.startBackgroundRead()
-	return T.closed
+	if T.closed.isFalse() {
+		T.r.startBackgroundRead()
+	}
+	return T.closedSignal
 }
-
 func (T *Conn) closeNotify(err error) {
 	select{
-	case <-T.closed:
+	case _, ok := <-T.closedSignal:
+		if !ok {
+			return
+		}
 	default:
 	}
 	if err == io.EOF {
-		T.closed <- err
+		T.closedSignal <- err
 		return
-	}else if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
-		T.closed <- err
-		return
-	} else if oe, ok := err.(*net.OpError); ok && (oe.Op == "read" || oe.Op == "write") {
-		T.closed <- err
+	}else if oe, ok := err.(*net.OpError); ok && (oe.Op == "read" || oe.Op == "write") {
+		T.closedSignal <- err
 		return
 	}
 }
-
 func (T *Conn) Read(b []byte) (n int, err error) {
 	T.r.abortPendingRead()
 	n, err = T.r.Read(b)
@@ -60,15 +67,16 @@ func (T *Conn) Write(b []byte) (n int, err error) {
 	return
 }
 func (T *Conn) Close() error {
-	T.m.Lock()
-	defer T.m.Unlock()
+	if T.closed.setTrue() {
+		return nil
+	}
 	select{
-	case _, ok := <- T.closed:
+	case _, ok := <-T.closedSignal:
 		if ok {
-			close(T.closed)
+			close(T.closedSignal)
 		}
 	default:
-		close(T.closed)
+		close(T.closedSignal)
 	}
 	return T.rwc.Close()
 }
@@ -94,11 +102,11 @@ type connReader struct {
   	conn 	*Conn															// 上级
   	                            											
   	mu      sync.Mutex														// 锁
-  	hasByte bool															// 检测有数据
+  	hasByte atomicBool														// 检测有数据
   	byteBuf [1]byte															// 第一个数据，检测时候得到一个数据
   	cond    *sync.Cond														// 组
-  	inRead  bool															// 正在读取
-  	aborted bool															// 结束
+  	inRead  atomicBool														// 正在读取
+  	aborted atomicBool														// 结束
 }
 
 //锁，条件等待
@@ -114,34 +122,37 @@ func (T *connReader) unlock() {T.mu.Unlock()}
 
 //开始后台读取
 func (T *connReader) startBackgroundRead() {
-	T.lock()
-  	defer T.unlock()
-  	if T.inRead {
+  	if T.inRead.isTrue() {
   		return
   	}
-  	if T.hasByte {
+  	if T.hasByte.isTrue() {
   		return
   	}
-  	T.inRead = true
-  	T.conn.rwc.SetReadDeadline(time.Time{})
   	go T.backgroundRead()
 }
 
 //后台读取
 func (T *connReader) backgroundRead() {
+	T.lock()
+	if T.inRead.setTrue() {
+		T.unlock()
+		return
+	}
+	T.unlock()
+  	T.conn.rwc.SetReadDeadline(time.Time{})
 	n, err := T.conn.rwc.Read(T.byteBuf[:])
 	T.lock()
 	if n == 1 {
-		T.hasByte = true
+		T.hasByte.setTrue()
 	}
-	if ne, ok := err.(net.Error); ok && T.aborted && ne.Timeout() {
+	if ne, ok := err.(net.Error); ok && T.aborted.isTrue() && ne.Timeout() {
 		//忽略这个错误。 这是另一个调用abortPendingRead的例程的预期错误。
 	}else if err != nil {
 		//主动关闭连接，造成读取失败
 		T.conn.closeNotify(err)
 	}
-	T.aborted = false
-	T.inRead = false
+	T.aborted.setFalse()
+	T.inRead.setFalse()
 	T.unlock()
 	T.cond.Broadcast()
 }
@@ -150,12 +161,12 @@ func (T *connReader) backgroundRead() {
 func (T *connReader) abortPendingRead() {
 	T.lock()
 	defer T.unlock()
-	if !T.inRead {
+	if T.inRead.isFalse() {
 		return
 	}
-	T.aborted = true
+	T.aborted.setTrue()
 	T.conn.rwc.SetReadDeadline(time.Unix(1, 0))
-	for T.inRead {
+	for T.inRead.isTrue() {
 		T.cond.Wait()
 	}
 	T.conn.rwc.SetReadDeadline(T.conn.readDeadline)
@@ -163,30 +174,28 @@ func (T *connReader) abortPendingRead() {
 
 //读取数据
 func (T *connReader) Read(p []byte) (n int, err error) {
-	T.lock()
-	if T.inRead {
-		T.unlock()
-		panic("vconn: current call .Read() invalid")
-	}
-
 	if len(p) == 0 {
-		T.unlock()
 		return 0, nil
 	}
 
-	if T.hasByte {
+	T.lock()
+	for T.inRead.isTrue() {
+		T.unlock()
+		T.abortPendingRead()
+		T.lock()
+	}
+	
+	if T.hasByte.isTrue() {
 		p[0] = T.byteBuf[0]
-		T.hasByte = false
+		T.hasByte.setFalse()
 		T.unlock()
 		return 1, nil
 	}
 
-	T.inRead = true
+	T.inRead.setTrue()
 	T.unlock()
 	n, err = T.conn.rwc.Read(p)
-	T.lock()
-	T.inRead = false
-	T.unlock()
+	T.inRead.setFalse()
 	T.cond.Broadcast()
 	return n, err
 }
