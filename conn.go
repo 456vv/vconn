@@ -21,7 +21,6 @@ func NewConn(c net.Conn) net.Conn {
 	if conn, ok := c.(*Conn); ok {
 		return conn
 	}
-	
 	conn := &Conn{rwc:c, closed:make(chan error, 1)}
 	conn.r = &connReader{conn:conn}
 	return conn
@@ -30,7 +29,6 @@ func (T *Conn) CloseNotify() <-chan error {
 	T.r.startBackgroundRead()
 	return T.closed
 }
-
 func (T *Conn) closeNotify(err error) {
 	select{
 	case <-T.closed:
@@ -47,7 +45,6 @@ func (T *Conn) closeNotify(err error) {
 		return
 	}
 }
-
 func (T *Conn) Read(b []byte) (n int, err error) {
 	T.r.abortPendingRead()
 	n, err = T.r.Read(b)
