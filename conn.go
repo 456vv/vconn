@@ -23,7 +23,7 @@ type Conn struct {
 	r				*connReader
 	readDeadline	time.Time
 	m				sync.Mutex
-	closed		atomicBool
+	closed			atomicBool
 }
 func NewConn(c net.Conn) net.Conn {
 	if conn, ok := c.(*Conn); ok {
@@ -49,16 +49,16 @@ func (T *Conn) closeNotify(err error) {
 	}
 	if err == io.EOF {
 		T.closedSignal <- err
-		return
 	}else if oe, ok := err.(*net.OpError); ok && (oe.Op == "read" || oe.Op == "write") {
 		T.closedSignal <- err
-		return
 	}
 }
 func (T *Conn) Read(b []byte) (n int, err error) {
-	T.r.abortPendingRead()
 	n, err = T.r.Read(b)
 	T.closeNotify(err)
+	if T.closed.isFalse() {
+		T.r.startBackgroundRead()
+	}
 	return
 }
 func (T *Conn) Write(b []byte) (n int, err error) {
