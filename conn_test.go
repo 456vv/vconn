@@ -39,6 +39,8 @@ func Test_conn_Read_1(t *testing.T){
 			t.Fatal(err.Error())
 		}
 		netConn.Close()
+		netConn.Close()
+		netConn.Close()
 	}(t)
 	
 	//发送端
