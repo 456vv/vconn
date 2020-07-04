@@ -22,6 +22,7 @@ type Conn struct {
 	closedSignal 	chan error
 	r				*connReader
 	readDeadline	time.Time
+	writeDeadline	time.Time
 	m				sync.Mutex
 	closed			atomicBool
 }
@@ -47,15 +48,15 @@ func (T *Conn) closeNotify(err error) {
 		}
 	default:
 	}
-	if err == io.EOF {
-		T.closedSignal <- err
-	}else if oe, ok := err.(*net.OpError); ok && (oe.Op == "read" || oe.Op == "write") {
+	if isCommonNetError(err) {
 		T.closedSignal <- err
 	}
 }
 func (T *Conn) Read(b []byte) (n int, err error) {
 	n, err = T.r.Read(b)
-	T.closeNotify(err)
+	if T.readDeadline.IsZero() {
+		T.closeNotify(err)
+	}
 	if T.closed.isFalse() {
 		T.r.startBackgroundRead()
 	}
@@ -63,7 +64,9 @@ func (T *Conn) Read(b []byte) (n int, err error) {
 }
 func (T *Conn) Write(b []byte) (n int, err error) {
 	n, err = T.rwc.Write(b)
-	T.closeNotify(err)
+	if T.writeDeadline.IsZero() {
+		T.closeNotify(err)
+	}
 	return
 }
 func (T *Conn) Close() error {
@@ -88,6 +91,7 @@ func (T *Conn) RemoteAddr() net.Addr {
 }
 func (T *Conn) SetDeadline(t time.Time) error  {
 	T.readDeadline = t
+	T.writeDeadline = t
 	return T.rwc.SetDeadline(t)
 }
 func (T *Conn) SetReadDeadline(t time.Time) error {
@@ -95,6 +99,7 @@ func (T *Conn) SetReadDeadline(t time.Time) error {
 	return T.rwc.SetReadDeadline(t)
 }
 func (T *Conn) SetWriteDeadline(t time.Time) error {
+	T.writeDeadline = t
 	return T.rwc.SetWriteDeadline(t)
 }
 
@@ -191,7 +196,7 @@ func (T *connReader) Read(p []byte) (n int, err error) {
 		T.unlock()
 		return 1, nil
 	}
-
+	
 	T.inRead.setTrue()
 	T.unlock()
 	n, err = T.conn.rwc.Read(p)
@@ -201,7 +206,18 @@ func (T *connReader) Read(p []byte) (n int, err error) {
 }
 
 
-
+func isCommonNetError(err error) bool {
+	if err == io.EOF {
+		return true
+	}
+	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+		return true
+	}
+	if oe, ok := err.(*net.OpError); ok && (oe.Op == "read" || oe.Op == "write") {
+		return true
+	}
+	return false
+}
 
 
 
