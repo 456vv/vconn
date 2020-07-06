@@ -14,7 +14,7 @@ func (T *atomicBool) setTrue() bool	{ return !atomic.CompareAndSwapInt32((*int32
 func (T *atomicBool) setFalse() bool{ return atomic.CompareAndSwapInt32((*int32)(T), 1, 0)}
 
 type CloseNotifier interface {
-    CloseNotify() <-chan error
+    CloseNotify() <-chan error		// 事件通知
 }
 
 type Conn struct {
@@ -25,6 +25,7 @@ type Conn struct {
 	writeDeadline	time.Time
 	m				sync.Mutex
 	closed			atomicBool
+	notifying		bool
 }
 func NewConn(c net.Conn) net.Conn {
 	if conn, ok := c.(*Conn); ok {
@@ -36,6 +37,7 @@ func NewConn(c net.Conn) net.Conn {
 }
 func (T *Conn) CloseNotify() <-chan error {
 	if T.closed.isFalse() {
+		T.notifying=true
 		T.r.startBackgroundRead()
 	}
 	return T.closedSignal
@@ -49,6 +51,7 @@ func (T *Conn) closeNotify(err error) {
 	default:
 	}
 	if isCommonNetError(err) {
+		T.notifying=false
 		T.closedSignal <- err
 	}
 }
@@ -57,7 +60,9 @@ func (T *Conn) Read(b []byte) (n int, err error) {
 	if T.readDeadline.IsZero() {
 		T.closeNotify(err)
 	}
-	if T.closed.isFalse() {
+	//仅限在用户主动读取的时候，并之前没有收到通知事件情况下才能再次开启后台监听
+	//因为用户主动读取时候关闭了后台监听
+	if T.closed.isFalse() && T.notifying {
 		T.r.startBackgroundRead()
 	}
 	return
