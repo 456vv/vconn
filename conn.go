@@ -4,7 +4,7 @@ import(
 	"net"
 	"time"
 	"sync"
-	"io"
+	"os"
 	"sync/atomic"
 )
 type atomicBool int32
@@ -35,6 +35,10 @@ func NewConn(c net.Conn) net.Conn {
 	conn.r = &connReader{conn:conn}
 	return conn
 }
+//注意：这里会有两个通知，1）远程主动断开 2）本地调用断开
+//如果你是用于断开连接重连，需要判断返回的 error 状态。
+//error != nil 表示远程主动断开（一般用于这个）
+//error == nil 表示本地调用断开
 func (T *Conn) CloseNotify() <-chan error {
 	if T.closed.isFalse() {
 		T.notifying=true
@@ -212,22 +216,26 @@ func (T *connReader) Read(p []byte) (n int, err error) {
 
 
 func isCommonNetError(err error) bool {
-	if err == io.EOF {
-		return true
-	}
-	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
-		return true
-	}
-	if oe, ok := err.(*net.OpError); ok && (oe.Op == "read" || oe.Op == "write") {
-		return true
+	if oe, ok := err.(*net.OpError); ok{
+		if isConnError(oe.Err) {
+			return true
+		}
+		if se, ok := oe.Err.(*os.SyscallError); ok{
+			if isConnError(se.Err) {
+				return true
+			}
+			//这里是常规错误，不使用
+			//switch se.Syscall {
+			//case "wsarecv", "wsasend", "wsarecvfrom", "wsasendto", "wsarecvmsg", "wsasendmsg":
+			//	fallthrough
+			//case "read", "write", "recvfrom", "write", "recvmsg", "sendmsg":
+			//	return true
+			//default:
+			//	return false
+			//}
+		}
 	}
 	return false
 }
-
-
-
-
-
-
 
 
