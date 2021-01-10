@@ -6,6 +6,7 @@ import(
 	"sync"
 	"os"
 	"sync/atomic"
+	"io"
 )
 type atomicBool int32
 func (T *atomicBool) isTrue() bool 	{ return atomic.LoadInt32((*int32)(T)) != 0 }
@@ -224,7 +225,7 @@ func isCommonNetError(err error) bool {
 		nerr = sys.Err
 	}
 	
-	if isConnError(nerr) {
+	if isConnError(nerr) || nerr == io.EOF {
 		return true
 	}
 	//这里是常规错误，不使用
