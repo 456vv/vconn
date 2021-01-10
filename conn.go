@@ -54,6 +54,7 @@ func (T *Conn) closeNotify(err error) {
 		}
 	default:
 	}
+	
 	if isCommonNetError(err) {
 		T.notifying=false
 		T.closedSignal <- err
@@ -61,9 +62,7 @@ func (T *Conn) closeNotify(err error) {
 }
 func (T *Conn) Read(b []byte) (n int, err error) {
 	n, err = T.r.Read(b)
-	if T.readDeadline.IsZero() {
-		T.closeNotify(err)
-	}
+	T.closeNotify(err)
 	//仅限在用户主动读取的时候，并之前没有收到通知事件情况下才能再次开启后台监听
 	//因为用户主动读取时候关闭了后台监听
 	if T.closed.isFalse() && T.notifying {
@@ -73,9 +72,7 @@ func (T *Conn) Read(b []byte) (n int, err error) {
 }
 func (T *Conn) Write(b []byte) (n int, err error) {
 	n, err = T.rwc.Write(b)
-	if T.writeDeadline.IsZero() {
-		T.closeNotify(err)
-	}
+	T.closeNotify(err)
 	return
 }
 func (T *Conn) Close() error {
@@ -216,25 +213,29 @@ func (T *connReader) Read(p []byte) (n int, err error) {
 
 
 func isCommonNetError(err error) bool {
-	if oe, ok := err.(*net.OpError); ok{
-		if isConnError(oe.Err) {
-			return true
+	nerr := err
+	if op, ok := nerr.(*net.OpError); ok {
+		if op.Timeout() {
+			return false
 		}
-		if se, ok := oe.Err.(*os.SyscallError); ok{
-			if isConnError(se.Err) {
-				return true
-			}
-			//这里是常规错误，不使用
-			//switch se.Syscall {
-			//case "wsarecv", "wsasend", "wsarecvfrom", "wsasendto", "wsarecvmsg", "wsasendmsg":
-			//	fallthrough
-			//case "read", "write", "recvfrom", "write", "recvmsg", "sendmsg":
-			//	return true
-			//default:
-			//	return false
-			//}
-		}
+		nerr = op.Err
 	}
+	if sys, ok := nerr.(*os.SyscallError); ok {
+		nerr = sys.Err
+	}
+	
+	if isConnError(nerr) {
+		return true
+	}
+	//这里是常规错误，不使用
+	//switch se.Syscall {
+	//case "wsarecv", "wsasend", "wsarecvfrom", "wsasendto", "wsarecvmsg", "wsasendmsg":
+	//	fallthrough
+	//case "read", "write", "recvfrom", "write", "recvmsg", "sendmsg":
+	//	return true
+	//default:
+	//	return false
+	//}
 	return false
 }
 
