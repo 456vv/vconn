@@ -27,6 +27,7 @@ type Conn struct {
 	m				sync.Mutex
 	closed			atomicBool
 	notifying		bool
+	readDiscard		bool
 }
 func NewConn(c net.Conn) net.Conn {
 	if conn, ok := c.(*Conn); ok {
@@ -36,6 +37,12 @@ func NewConn(c net.Conn) net.Conn {
 	conn.r = &connReader{conn:conn}
 	return conn
 }
+
+//读取丢弃，只要用于连接加入连接池后，期间收到的数据全部丢弃。
+func (T *Conn) SetReadDiscard(ok bool) {
+	T.readDiscard = ok
+}
+
 //注意：这里会有两个通知，1）远程主动断开 2）本地调用断开
 //如果你是用于断开连接重连，需要判断返回的 error 状态。
 //error != nil 表示远程主动断开（一般用于这个）
@@ -151,8 +158,21 @@ func (T *connReader) backgroundRead() {
 		return
 	}
 	T.unlock()
-  	T.conn.rwc.SetReadDeadline(time.Time{})
-	n, err := T.conn.rwc.Read(T.byteBuf[:])
+  	var n int
+  	var err error
+  	if T.conn.readDiscard {
+  		buf := make([]byte, 4 * 1024)
+  		for {
+  			T.conn.rwc.SetReadDeadline(time.Time{})
+  			_, err = T.conn.rwc.Read(buf)
+  			if err != nil {
+  				break
+  			}
+  		}
+  	}else{
+  		T.conn.rwc.SetReadDeadline(time.Time{})
+		n, err = T.conn.rwc.Read(T.byteBuf[:])
+  	}
 	T.lock()
 	if n == 1 {
 		T.hasByte.setTrue()
