@@ -19,15 +19,15 @@ type CloseNotifier interface {
 }
 
 type Conn struct {
-	rwc				net.Conn
-	closedSignal 	chan error
-	r				*connReader
-	readDeadline	time.Time
-	writeDeadline	time.Time
-	m				sync.Mutex
-	closed			atomicBool
-	notifying		bool
-	readDiscard		bool
+	rwc						net.Conn
+	closedSignal 			chan error
+	r						*connReader
+	readDeadline			time.Time
+	writeDeadline			time.Time
+	m						sync.Mutex
+	closed					atomicBool
+	notifying				bool
+	backgroundReadDiscard	bool
 }
 func NewConn(c net.Conn) net.Conn {
 	if conn, ok := c.(*Conn); ok {
@@ -38,9 +38,10 @@ func NewConn(c net.Conn) net.Conn {
 	return conn
 }
 
-//读取丢弃，只要用于连接加入连接池后，期间收到的数据全部丢弃。
-func (T *Conn) SetReadDiscard(ok bool) {
-	T.readDiscard = ok
+//后台读取丢弃，只要用于连接加入连接池后，期间收到的数据全部丢弃。
+//用于特殊环境，普通用户正常不需要用到他。
+func (T *Conn) SetBackgroundReadDiscard(ok bool) {
+	T.backgroundReadDiscard = ok
 }
 
 //注意：这里会有两个通知，1）远程主动断开 2）本地调用断开
@@ -160,8 +161,8 @@ func (T *connReader) backgroundRead() {
 	T.unlock()
   	var n int
   	var err error
-  	if T.conn.readDiscard {
-  		buf := make([]byte, 4 * 1024)
+  	if T.conn.backgroundReadDiscard {
+  		buf := make([]byte, 512)
   		for {
   			T.conn.rwc.SetReadDeadline(time.Time{})
   			_, err = T.conn.rwc.Read(buf)
