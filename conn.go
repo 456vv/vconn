@@ -48,7 +48,7 @@ func (T *Conn) SetBackgroundReadDiscard(ok bool) {
 //如果你是用于断开连接重连，需要判断返回的 error 状态。
 //error != nil 表示远程主动断开（一般用于这个）
 //error == nil 表示本地调用断开
-func (T *Conn) CloseNotify() <-chan error {
+func (T *Conn) CloseNotify() <-chan error {	
 	if T.closed.isFalse() {
 		T.notifying=true
 		T.r.startBackgroundRead()
@@ -56,6 +56,9 @@ func (T *Conn) CloseNotify() <-chan error {
 	return T.closedSignal
 }
 func (T *Conn) closeNotify(err error) {
+	T.m.Lock()
+	defer T.m.Unlock()
+	
 	select{
 	case _, ok := <-T.closedSignal:
 		if !ok {
@@ -85,9 +88,13 @@ func (T *Conn) Write(b []byte) (n int, err error) {
 	return
 }
 func (T *Conn) Close() error {
+	T.m.Lock()
+	defer T.m.Unlock()
+	
 	if T.closed.setTrue() {
 		return nil
 	}
+	
 	select{
 	case _, ok := <-T.closedSignal:
 		if ok {
