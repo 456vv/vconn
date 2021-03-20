@@ -9,6 +9,7 @@ type CloseNotifier interface {                          // 关闭通知接口
 type Conn struct {                                      // 连接
 }
     func NewConn(c net.Conn) net.Conn                           // 新连接
+    func (T *Conn) SetReadDiscard(ok bool)                      // 读取读取丢弃
     func (T *Conn) CloseNotify() <-chan error                   // 关闭通知
     func (T *Conn) Read(b []byte) (n int, err error)            // 读取
     func (T *Conn) Write(b []byte) (n int, err error)           // 写入

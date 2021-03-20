@@ -19,14 +19,15 @@ type CloseNotifier interface {
 }
 
 type Conn struct {
-	rwc				net.Conn
-	closedSignal 	chan error
-	r				*connReader
-	readDeadline	time.Time
-	writeDeadline	time.Time
-	m				sync.Mutex
-	closed			atomicBool
-	notifying		bool
+	rwc						net.Conn
+	closedSignal 			chan error
+	r						*connReader
+	readDeadline			time.Time
+	writeDeadline			time.Time
+	m						sync.Mutex
+	closed					atomicBool
+	notifying				bool
+	backgroundReadDiscard	bool
 }
 func NewConn(c net.Conn) net.Conn {
 	if conn, ok := c.(*Conn); ok {
@@ -36,11 +37,18 @@ func NewConn(c net.Conn) net.Conn {
 	conn.r = &connReader{conn:conn}
 	return conn
 }
+
+//后台读取丢弃，只要用于连接加入连接池后，期间收到的数据全部丢弃。
+//用于特殊环境，普通用户正常不需要用到他。
+func (T *Conn) SetBackgroundReadDiscard(ok bool) {
+	T.backgroundReadDiscard = ok
+}
+
 //注意：这里会有两个通知，1）远程主动断开 2）本地调用断开
 //如果你是用于断开连接重连，需要判断返回的 error 状态。
 //error != nil 表示远程主动断开（一般用于这个）
 //error == nil 表示本地调用断开
-func (T *Conn) CloseNotify() <-chan error {
+func (T *Conn) CloseNotify() <-chan error {	
 	if T.closed.isFalse() {
 		T.notifying=true
 		T.r.startBackgroundRead()
@@ -48,6 +56,9 @@ func (T *Conn) CloseNotify() <-chan error {
 	return T.closedSignal
 }
 func (T *Conn) closeNotify(err error) {
+	T.m.Lock()
+	defer T.m.Unlock()
+	
 	select{
 	case _, ok := <-T.closedSignal:
 		if !ok {
@@ -77,9 +88,13 @@ func (T *Conn) Write(b []byte) (n int, err error) {
 	return
 }
 func (T *Conn) Close() error {
+	T.m.Lock()
+	defer T.m.Unlock()
+	
 	if T.closed.setTrue() {
 		return nil
 	}
+	
 	select{
 	case _, ok := <-T.closedSignal:
 		if ok {
@@ -151,8 +166,21 @@ func (T *connReader) backgroundRead() {
 		return
 	}
 	T.unlock()
-  	T.conn.rwc.SetReadDeadline(time.Time{})
-	n, err := T.conn.rwc.Read(T.byteBuf[:])
+  	var n int
+  	var err error
+  	if T.conn.backgroundReadDiscard {
+  		buf := make([]byte, 512)
+  		for {
+  			T.conn.rwc.SetReadDeadline(time.Time{})
+  			_, err = T.conn.rwc.Read(buf)
+  			if err != nil {
+  				break
+  			}
+  		}
+  	}else{
+  		T.conn.rwc.SetReadDeadline(time.Time{})
+		n, err = T.conn.rwc.Read(T.byteBuf[:])
+  	}
 	T.lock()
 	if n == 1 {
 		T.hasByte.setTrue()
