@@ -26,7 +26,7 @@ type Conn struct {
 	writeDeadline			time.Time
 	m						sync.Mutex
 	closed					atomicBool
-	notifying				bool
+	receiveNotifying		atomicBool
 	backgroundReadDiscard	bool
 }
 func NewConn(c net.Conn) net.Conn {
@@ -47,10 +47,10 @@ func (T *Conn) SetBackgroundReadDiscard(ok bool) {
 //注意：这里会有两个通知，1）远程主动断开 2）本地调用断开
 //如果你是用于断开连接重连，需要判断返回的 error 状态。
 //error != nil 表示远程主动断开（一般用于这个）
-//error == nil 表示本地调用断开
+//error == nil 表示本地调用断开（关闭连接，通道关闭，返回nil）
 func (T *Conn) CloseNotify() <-chan error {	
 	if T.closed.isFalse() {
-		T.notifying=true
+		T.receiveNotifying.setTrue()
 		T.r.startBackgroundRead()
 	}
 	return T.closedSignal
@@ -59,16 +59,16 @@ func (T *Conn) closeNotify(err error) {
 	T.m.Lock()
 	defer T.m.Unlock()
 	
-	select{
-	case _, ok := <-T.closedSignal:
-		if !ok {
-			return
-		}
-	default:
-	}
-	
 	if isCommonNetError(err) {
-		T.notifying=false
+		select{
+		case _, ok := <-T.closedSignal:
+			if !ok {
+				return
+			}
+		default:
+		}
+		
+		T.receiveNotifying.setFalse()
 		T.closedSignal <- err
 	}
 }
@@ -77,7 +77,7 @@ func (T *Conn) Read(b []byte) (n int, err error) {
 	T.closeNotify(err)
 	//仅限在用户主动读取的时候，并之前没有收到通知事件情况下才能再次开启后台监听
 	//因为用户主动读取时候关闭了后台监听
-	if T.closed.isFalse() && T.notifying {
+	if T.closed.isFalse() && T.receiveNotifying.isTrue() {
 		T.r.startBackgroundRead()
 	}
 	return
