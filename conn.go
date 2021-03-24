@@ -225,18 +225,26 @@ func (T *connReader) Read(p []byte) (n int, err error) {
 		T.lock()
 	}
 	
-	if T.hasByte.isTrue() {
+	pt := p
+	var hasByte = T.hasByte.isTrue()
+	if hasByte {
 		p[0] = T.byteBuf[0]
 		T.hasByte.setFalse()
-		T.unlock()
-		return 1, nil
+		if len(p) == 1 {
+			T.unlock()
+			return 1, nil
+		}
+		pt = p[1:]
 	}
-	
 	T.inRead.setTrue()
 	T.unlock()
-	n, err = T.conn.rwc.Read(p)
+	n, err = T.conn.rwc.Read(pt)
 	T.inRead.setFalse()
 	T.cond.Broadcast()
+	if hasByte {
+		n++
+		err = nil
+	}
 	return n, err
 }
 
