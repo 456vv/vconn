@@ -8,7 +8,11 @@ import(
 	"sync/atomic"
 	"io"
 	"math"
+	""
 )
+
+var errorConnRAWRead 		= errors.New("vconn: The original connection cannot be read repeatedly")
+
 type atomicBool int32
 func (T *atomicBool) isTrue() bool 	{ return atomic.LoadInt32((*int32)(T)) != 0 }
 func (T *atomicBool) isFalse() bool	{ return atomic.LoadInt32((*int32)(T)) != 1 }
@@ -28,6 +32,7 @@ type Conn struct {
 	writeDeadline			time.Time
 	m						sync.Mutex
 	closed					atomicBool
+	rawRead					atomicBool
 	disableBackgroundRead	bool
 	backgroundReadDiscard	bool
 }
@@ -38,6 +43,24 @@ func NewConn(c net.Conn) net.Conn {
 	conn := &Conn{rwc:c}
 	conn.r = &connReader{conn:conn}
 	return conn
+}
+
+//返回原始连接
+func (T *Conn) RawConn() net.Conn {
+	if T.rawRead.setTrue() {
+		panic(errorConnRAWRead)
+	}
+	
+	T.m.Lock()
+	defer T.m.Unlock()
+	
+	T.DisableBackgroundRead(true)
+	T.close()
+	
+	rwc := T.rwc
+	T.rwc=nil
+	T.r=nil
+	return rwc
 }
 
 //后台读取丢弃，只要用于连接加入连接池后，期间收到的数据全部丢弃。
@@ -111,14 +134,19 @@ func (T *Conn) Write(b []byte) (n int, err error) {
 func (T *Conn) Close() error {
 	T.m.Lock()
 	defer T.m.Unlock()
-	
+	return T.close()
+}
+func (T *Conn) close() error {
 	for _, c  := range T.closeSignal {
 		close(c)
 	}
 	T.closeSignal=nil
 	T.closeErr = io.EOF
 	
-	return T.rwc.Close()
+	if T.rwc != nil {
+		return T.rwc.Close()
+	}
+	return nil
 }
 func (T *Conn) LocalAddr() net.Addr {
 	return T.rwc.LocalAddr()
