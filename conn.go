@@ -8,7 +8,7 @@ import(
 	"sync/atomic"
 	"io"
 	"math"
-	""
+	"errors"
 )
 
 var errorConnRAWRead 		= errors.New("vconn: The original connection cannot be read repeatedly")
