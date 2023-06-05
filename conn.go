@@ -61,11 +61,13 @@ func (T *Conn) RawConn() net.Conn {
 	defer T.m.Unlock()
 
 	T.DisableBackgroundRead(true)
-	T.close()
 
 	rwc := T.rwc
 	T.rwc = nil
 	T.r = nil
+
+	T.close()
+
 	return rwc
 }
 
@@ -76,6 +78,7 @@ func (T *Conn) SetBackgroundReadDiscard(y bool) {
 }
 
 // 设置读取限制
+//
 //	remain int	设置 0 默认限制为(math.MaxInt32)
 func (T *Conn) SetReadLimit(remain int) {
 	T.r.setReadLimit(remain)
@@ -210,6 +213,7 @@ func (T *connReader) lock() {
 func (T *connReader) unlock() { T.mu.Unlock() }
 
 // 设置读取限制
+//
 //	remain int	设置 0 默认限制为(math.MaxInt32)
 func (T *connReader) setReadLimit(remain int) {
 	if remain == 0 {
