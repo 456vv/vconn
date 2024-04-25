@@ -51,7 +51,8 @@ func NewConn(c net.Conn) net.Conn {
 	return New(c)
 }
 
-// 返回原始连接
+// 返回原始连接；如果在后台读取时候，收到1位数据。此时读取出源连接后，读取数据会少1位。造成数据不完整。
+// 可以使用 RawConnFull判断有没有后台收到一位数据。
 func (T *Conn) RawConn() net.Conn {
 	if T.rawRead.setTrue() {
 		panic(errorConnRAWRead)
@@ -69,6 +70,21 @@ func (T *Conn) RawConn() net.Conn {
 	T.close()
 
 	return rwc
+}
+
+// 判断该源始连接是否完整可用。
+//
+//	p []byte 	读取已经在后台得到的数据
+//	net.Conn	源连接
+//	int			0连接是完整的, >0 有后台数据
+func (T *Conn) RawConnFull(p []byte) (net.Conn, int) {
+	if T.r.hasByte.isTrue() {
+		if p != nil {
+			p[0] = T.r.byteBuf[0]
+		}
+		return T.RawConn(), 1
+	}
+	return T.RawConn(), 0
 }
 
 // 后台读取丢弃，只要用于连接加入连接池后，期间收到的数据全部丢弃。
