@@ -123,7 +123,7 @@ func (T *Conn) CloseNotify() <-chan error {
 		return c
 	}
 
-	T.r.startBackgroundRead()
+	go T.r.backgroundRead()
 	T.closeSignal = append(T.closeSignal, c)
 	return c
 }
@@ -149,7 +149,7 @@ func (T *Conn) Read(b []byte) (n int, err error) {
 	// 仅限在用户主动读取的时候，并之前没有收到通知事件情况下才能再次开启后台监听
 	// 因为用户主动读取时候关闭了后台监听
 	if T.closeErr == nil && len(T.closeSignal) != 0 {
-		T.r.startBackgroundRead()
+		go T.r.backgroundRead()
 	}
 	return
 }
@@ -249,30 +249,18 @@ func (T *connReader) hitReadLimit() bool {
 	return T.remain <= 0
 }
 
-// 开始后台读取
-func (T *connReader) startBackgroundRead() {
-	if T.inRead.isTrue() || T.conn.disableBackgroundRead {
-		return
-	}
-	if T.hasByte.isTrue() {
-		return
-	}
-	go T.backgroundRead()
-}
-
 // 后台读取
 func (T *connReader) backgroundRead() {
 	T.lock()
-	if T.conn.disableBackgroundRead {
+	if T.aborted.isTrue() || T.inRead.isTrue() || T.hasByte.isTrue() || T.conn.disableBackgroundRead {
 		T.unlock()
 		return
 	}
-	if T.inRead.setTrue() { // 这里是设置，并返回原值
-		T.unlock()
-		return
-	}
-	T.inBackRead.setTrue()
+
+	T.inRead.setTrue()     // 1
+	T.inBackRead.setTrue() // 1
 	T.unlock()
+
 	var n int
 	var err error
 	if T.conn.backgroundReadDiscard {
@@ -287,20 +275,20 @@ func (T *connReader) backgroundRead() {
 	} else if T.aborted.isFalse() { // 多线程，已经中止后，防止依然执行。
 		T.conn.rwc.SetReadDeadline(time.Time{})
 		n, err = T.conn.rwc.Read(T.byteBuf[:])
+		if n == 1 {
+			T.hasByte.setTrue()
+		}
 	}
+
 	T.lock()
-	if n == 1 {
-		T.hasByte.setTrue()
-	}
 	if ne, ok := err.(net.Error); ok && T.aborted.isTrue() && ne.Timeout() {
 		// 忽略这个错误。 这是另一个调用abortPendingRead的例程的预期错误。
 	} else if err != nil {
 		// 主动关闭连接，造成读取失败
 		T.conn.closeNotify(err)
 	}
-	T.aborted.setFalse()
-	T.inRead.setFalse()
-	T.inBackRead.setFalse()
+	T.inBackRead.setFalse() // 3
+	T.inRead.setFalse()     // 3
 	T.unlock()
 	T.cond.Broadcast()
 }
@@ -323,12 +311,14 @@ func (T *connReader) abortPendingRead() {
 	if T.inRead.isFalse() {
 		return
 	}
-	T.aborted.setTrue()
+
+	T.aborted.setTrue() // 2
 	T.conn.rwc.SetReadDeadline(time.Unix(1, 0))
 	for T.inRead.isTrue() {
 		T.cond.Wait()
 	}
 	T.conn.rwc.SetReadDeadline(T.conn.readDeadline)
+	T.aborted.setFalse() // 4
 }
 
 // 读取数据
@@ -365,11 +355,12 @@ func (T *connReader) Read(p []byte) (n int, err error) {
 		}
 		pt = p[1:]
 	}
-	T.inRead.setTrue()
+
+	T.inRead.setTrue() // 1
 	T.unlock()
-	n, err = T.conn.rwc.Read(pt)
-	T.inRead.setFalse()
-	T.cond.Broadcast()
+	n, err = T.conn.rwc.Read(pt[:])
+	T.inRead.setFalse() // 3
+	T.cond.Broadcast()  // 3
 	if hasByte {
 		n++
 		err = nil
