@@ -252,6 +252,10 @@ func (T *connReader) hitReadLimit() bool {
 // 后台读取
 func (T *connReader) backgroundRead() {
 	T.lock()
+	// T.aborted.isTrue() 终止后台读取，backgroundRead() 还没完全结束，再次进来无意义
+	// T.inRead.isTrue() 可能是后台读取 或 调用者读取，重复后台读取，也无意义
+	// T.hasByte.isTrue() 已经读取一位数据，再次后台读取更多位数据，也无意义
+	// T.conn.disableBackgroundRead	明确禁止后台读取
 	if T.aborted.isTrue() || T.inRead.isTrue() || T.hasByte.isTrue() || T.conn.disableBackgroundRead {
 		T.unlock()
 		return
@@ -263,17 +267,16 @@ func (T *connReader) backgroundRead() {
 
 	var n int
 	var err error
+	T.conn.rwc.SetReadDeadline(time.Time{})
 	if T.conn.backgroundReadDiscard {
 		buf := make([]byte, 512)
 		for T.aborted.isFalse() { // 多线程，已经中止后，防止依然执行。
-			T.conn.rwc.SetReadDeadline(time.Time{})
 			_, err = T.conn.rwc.Read(buf)
 			if err != nil {
 				break
 			}
 		}
 	} else if T.aborted.isFalse() { // 多线程，已经中止后，防止依然执行。
-		T.conn.rwc.SetReadDeadline(time.Time{})
 		n, err = T.conn.rwc.Read(T.byteBuf[:])
 		if n == 1 {
 			T.hasByte.setTrue()
