@@ -1,402 +1,299 @@
 package vconn
 
 import (
-	"errors"
-	"io"
-	"math"
 	"net"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-var errorConnRAWRead = errors.New("vconn: The original connection cannot be read repeatedly")
-
-type atomicBool int32
-
-func (T *atomicBool) isTrue() bool   { return atomic.LoadInt32((*int32)(T)) != 0 }
-func (T *atomicBool) isFalse() bool  { return atomic.LoadInt32((*int32)(T)) != 1 }
-func (T *atomicBool) setTrue() bool  { return !atomic.CompareAndSwapInt32((*int32)(T), 0, 1) }
-func (T *atomicBool) setFalse() bool { return atomic.CompareAndSwapInt32((*int32)(T), 1, 0) }
-
+// CloseNotifier 提供连接关闭通知能力
 type CloseNotifier interface {
-	CloseNotify() <-chan error // 事件通知
+	CloseNotify() <-chan error
 }
 
+// Conn 封装了标准的 net.Conn，具备高级异步断开监控、限流及防死锁提取功能
+// 所有公开方法均为并发安全
 type Conn struct {
-	rwc                   net.Conn
-	closeErr              error
-	closeSignal           []chan error
-	r                     *connReader
-	readDeadline          time.Time
-	writeDeadline         time.Time
-	m                     sync.Mutex
-	closed                atomicBool
-	rawRead               atomicBool
-	disableBackgroundRead bool
-	backgroundReadDiscard bool
+	rwc net.Conn // 底层真实连接
+
+	mu           sync.RWMutex // 保护 closeErr 和 closeSignals
+	closeErr     error        // 首次关闭错误（只记录一次）
+	closeSignals []chan error // 关闭通知管道队列
+
+	r *connReader // 读取器，负责后台预读和限流
+
+	// 用户设置的超时时间快照，用于恢复被后台读取修改的 deadline
+	readDeadline  atomic.Value // time.Time
+	writeDeadline atomic.Value // time.Time
+
+	closed                atomic.Bool // 连接是否已关闭
+	rawReadUsed           atomic.Bool // 原始连接是否已被提取
+	disableBackgroundRead atomic.Bool // 是否禁用后台读取
+	backgroundReadDiscard atomic.Bool // 后台读取是否丢弃数据
 }
 
+// New 包装原始连接。若已被包装，则直接返回本身
+// 参数 c 不能为 nil，否则会 panic
 func New(c net.Conn) *Conn {
-	if conn, ok := c.(*Conn); ok {
-		return conn
+	if c == nil {
+		panic("vconn: nil conn")
+	}
+	// 避免重复包装
+	if vc, ok := c.(*Conn); ok {
+		return vc
 	}
 	conn := &Conn{rwc: c}
-	conn.r = &connReader{conn: conn}
+	conn.r = newConnReader(conn)
+	// 初始化 deadline 为零值
+	conn.readDeadline.Store(time.Time{})
+	conn.writeDeadline.Store(time.Time{})
 	return conn
 }
 
+// NewConn 是 New 的别名，返回 net.Conn 接口
 func NewConn(c net.Conn) net.Conn {
 	return New(c)
 }
 
-// 返回原始连接；如果在后台读取时候，收到1位数据。此时读取出源连接后，读取数据会少1位。造成数据不完整。
-// 可以使用 RawConnFull判断有没有后台收到一位数据。
-func (T *Conn) RawConn() net.Conn {
-	if T.rawRead.setTrue() {
-		panic(errorConnRAWRead)
+// RawConn 剥离包装，归还底层真实连接
+// 剥离后，此 Conn 无法再读写，任何操作将返回 net.ErrClosed
+// 该方法只能调用一次，重复调用会 panic
+func (c *Conn) RawConn() net.Conn {
+	// 使用 CAS 确保只能提取一次
+	if c.rawReadUsed.Swap(true) {
+		panic(ErrRawConnAlreadyUsed)
 	}
 
-	T.m.Lock()
-	defer T.m.Unlock()
+	if c.closed.Swap(true) {
+		// 已经关闭，直接返回底层连接
+		return c.rwc
+	}
 
-	T.DisableBackgroundRead(true)
+	// 先禁用后台读取，再标记为已关闭
+	c.disableBackgroundRead.Store(true)
 
-	rwc := T.rwc
-	T.rwc = nil
-	T.r = nil
+	// 通知所有等待者连接已关闭
+	c.notifyClose(net.ErrClosed)
 
-	T.close()
+	// 中断后台读取协程
+	c.r.abortBackgroundRead()
 
-	return rwc
+	return c.rwc
 }
 
-// 判断该源始连接是否完整可用。
-//
-//	p []byte 	读取已经在后台得到的数据
-//	net.Conn	源连接
-//	int			0连接是完整的, >0 有后台数据
-func (T *Conn) RawConnFull(p []byte) (net.Conn, int) {
-	if T.r.hasByte.isTrue() {
-		if p != nil {
-			p[0] = T.r.byteBuf[0]
+// RawConnFull 归还原始连接，如果后台已经预读了 1 字节，会将其写回传入的 b 切片首位
+// 返回值：(原始连接, 预读字节数)
+func (c *Conn) RawConnFull(b []byte) (net.Conn, int) {
+	if c.r.hasPeekedByte() {
+		if len(b) > 0 {
+			b[0] = c.r.peekedByte()
 		}
-		return T.RawConn(), 1
+		return c.RawConn(), 1
 	}
-	return T.RawConn(), 0
+	return c.RawConn(), 0
 }
 
-// 后台读取丢弃，只要用于连接加入连接池后，期间收到的数据全部丢弃。
-// 用于特殊环境，普通用户正常不需要用到他。
-func (T *Conn) SetBackgroundReadDiscard(y bool) {
-	T.backgroundReadDiscard = y
+// SetBackgroundReadDiscard 设置后台读取是否丢弃数据
+// true: 循环读取并丢弃数据（用于检测断开）
+// false: 只预读 1 字节并缓存（默认模式）
+func (c *Conn) SetBackgroundReadDiscard(y bool) {
+	c.backgroundReadDiscard.Store(y)
 }
 
-// 设置读取限制
-//
-//	remain int	设置 0 默认限制为(math.MaxInt32)
-func (T *Conn) SetReadLimit(remain int) {
-	T.r.setReadLimit(remain)
+// SetReadLimit 设置读取限制字节数
+// remain < 0: 不限制
+// remain >= 0: 限制剩余可读字节数，超出后返回 io.EOF
+func (c *Conn) SetReadLimit(remain int64) {
+	c.r.setReadLimit(remain)
 }
 
-// 停止后台实时监听的连接关闭状态，在你自己调用Read或Write发生错误，依然 CloseNotify 返回连接关闭信号。
-func (T *Conn) DisableBackgroundRead(y bool) {
-	T.disableBackgroundRead = y
+// DisableBackgroundRead 禁用或启用后台读取
+// 禁用后，CloseNotify 将无法自动检测对端断开
+func (c *Conn) DisableBackgroundRead(y bool) {
+	c.disableBackgroundRead.Store(y)
 	if y {
-		// 中止后台读取
-		T.r.abortBackgroundRead()
+		c.r.abortBackgroundRead()
 	}
 }
 
-// 注意：这里会有两个通知，1）远程主动断开 2）本地调用断开
-// 如果你是用于断开连接重连，需要判断返回的 error 状态。
-// error != nil 表示远程主动断开（一般用于这个）
-// error == nil 表示本地调用断开（关闭连接，通道关闭，返回nil）
-func (T *Conn) CloseNotify() <-chan error {
-	T.m.Lock()
-	defer T.m.Unlock()
+// CloseNotify 获取关闭通知 Channel
+// 支持多次调用；在对端意外断开或本地主动 Close 时均会触发通知
+// 返回的 channel 会在连接关闭时接收到错误并关闭
+func (c *Conn) CloseNotify() <-chan error {
+	ch := make(chan error, 1)
 
-	c := make(chan error, 1)
-	if T.closeErr != nil {
-		c <- T.closeErr
-		return c
+	c.mu.Lock()
+	if c.closeErr != nil {
+		// 连接已关闭，立即通知
+		closeErr := c.closeErr
+		c.mu.Unlock()
+		ch <- closeErr
+		close(ch)
+		return ch
 	}
 
-	go T.r.backgroundRead()
-	T.closeSignal = append(T.closeSignal, c)
-	return c
+	// 注册通知管道
+	c.closeSignals = append(c.closeSignals, ch)
+	c.mu.Unlock()
+
+	// 启动后台读取以监控连接状态
+	c.r.startBackgroundRead()
+	return ch
 }
 
-func (T *Conn) closeNotify(err error) {
-	T.m.Lock()
-	defer T.m.Unlock()
+// IsClosed 返回连接是否已关闭
+func (c *Conn) IsClosed() bool {
+	return c.closed.Load()
+}
 
-	if isCommonNetError(err) {
+// Read 从连接读取数据
+// 实现 io.Reader 接口，线程安全
+func (c *Conn) Read(b []byte) (n int, err error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 
-		for _, c := range T.closeSignal {
-			c <- err
-			close(c)
+	n, err = c.r.Read(b)
+
+	// 如果发生网络错误，通知所有等待者
+	c.notifyClose(err)
+	if err == nil {
+		// 若前台 Read 顺利完成且连接依旧活跃，自动重新挂起后台监测协程
+		c.mu.RLock()
+		hasSignals := len(c.closeSignals) > 0
+		c.mu.RUnlock()
+		if hasSignals {
+			c.r.startBackgroundRead()
 		}
-		T.closeSignal = nil
-		T.closeErr = err
-	}
-}
-
-func (T *Conn) Read(b []byte) (n int, err error) {
-	n, err = T.r.Read(b)
-	T.closeNotify(err)
-	// 仅限在用户主动读取的时候，并之前没有收到通知事件情况下才能再次开启后台监听
-	// 因为用户主动读取时候关闭了后台监听
-	if T.closeErr == nil && len(T.closeSignal) != 0 {
-		go T.r.backgroundRead()
 	}
 	return
 }
 
-func (T *Conn) Write(b []byte) (n int, err error) {
-	n, err = T.rwc.Write(b)
-	T.closeNotify(err)
+// Write 向连接写入数据
+// 实现 io.Writer 接口，线程安全
+func (c *Conn) Write(b []byte) (n int, err error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+
+	n, err = c.rwc.Write(b)
+	// 如果发生网络错误，通知所有等待者
+	c.notifyClose(err)
 	return
 }
 
-func (T *Conn) Close() error {
-	T.m.Lock()
-	defer T.m.Unlock()
-	return T.close()
+// Close 主动关闭连接，干净清理所有通知管道
+// 实现 io.Closer 接口，线程安全，可重复调用
+func (c *Conn) Close() error {
+	// 使用 CAS 确保只关闭一次
+	if c.closed.Swap(true) {
+		return nil
+	}
+
+	// 通知所有等待者
+	c.notifyClose(net.ErrClosed)
+
+	// 中断后台读取
+	c.r.abortBackgroundRead()
+
+	return c.rwc.Close()
 }
 
-func (T *Conn) close() error {
-	for _, c := range T.closeSignal {
-		close(c)
+// notifyClose 在探测到对端非正常断开时分发错误通知
+// 只有首次调用会真正通知，后续调用会被忽略
+func (c *Conn) notifyClose(err error) {
+	// 只处理网络错误
+	if !isCommonNetError(err) {
+		return
 	}
-	T.closeSignal = nil
-	T.closeErr = io.EOF
 
-	if T.rwc != nil {
-		return T.rwc.Close()
+	c.mu.Lock()
+	// 已经通知过，直接返回
+	if c.closeErr != nil {
+		c.mu.Unlock()
+		return
+	}
+
+	// 记录首次错误，取出所有通知管道
+	closeSignals := c.closeSignals
+	c.closeErr = err
+	c.closeSignals = nil
+	c.mu.Unlock()
+
+	// 在锁外通知，避免死锁
+	for _, ch := range closeSignals {
+		// 非阻塞发送，避免接收者未准备好导致阻塞
+		select {
+		case ch <- err:
+		default:
+		}
+		close(ch)
+	}
+}
+
+// ==================== net.Conn 接口实现 ====================
+
+// LocalAddr 返回本地网络地址
+func (c *Conn) LocalAddr() net.Addr {
+	if c.closed.Load() {
+		return nil
+	}
+	return c.rwc.LocalAddr()
+}
+
+// RemoteAddr 返回远程网络地址
+func (c *Conn) RemoteAddr() net.Addr {
+	if c.closed.Load() {
+		return nil
+	}
+	return c.rwc.RemoteAddr()
+}
+
+// SetDeadline 同时设置读写超时时间
+func (c *Conn) SetDeadline(t time.Time) error {
+	c.readDeadline.Store(t)
+	c.writeDeadline.Store(t)
+	if c.closed.Load() {
+		return nil
+	}
+	return c.rwc.SetDeadline(t)
+}
+
+// SetReadDeadline 设置读取超时时间
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	c.readDeadline.Store(t)
+	if c.closed.Load() {
+		return nil
+	}
+	return c.rwc.SetReadDeadline(t)
+}
+
+// SetWriteDeadline 设置写入超时时间
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	c.writeDeadline.Store(t)
+	if c.closed.Load() {
+		return nil
+	}
+	return c.rwc.SetWriteDeadline(t)
+}
+
+// SetReadBuffer 设置操作系统接收缓冲区大小（仅 TCP 连接有效）
+func (c *Conn) SetReadBuffer(bytes int) error {
+	if !c.closed.Load() {
+		if tc, ok := c.rwc.(*net.TCPConn); ok {
+			return tc.SetReadBuffer(bytes)
+		}
 	}
 	return nil
 }
 
-func (T *Conn) LocalAddr() net.Addr {
-	return T.rwc.LocalAddr()
-}
-
-func (T *Conn) RemoteAddr() net.Addr {
-	return T.rwc.RemoteAddr()
-}
-
-func (T *Conn) SetDeadline(t time.Time) error {
-	T.readDeadline = t
-	T.writeDeadline = t
-	return T.rwc.SetDeadline(t)
-}
-
-func (T *Conn) SetReadDeadline(t time.Time) error {
-	T.readDeadline = t
-	return T.rwc.SetReadDeadline(t)
-}
-
-func (T *Conn) SetWriteDeadline(t time.Time) error {
-	T.writeDeadline = t
-	return T.rwc.SetWriteDeadline(t)
-}
-
-type connReader struct {
-	conn *Conn // 上级
-
-	mu         sync.Mutex // 锁
-	hasByte    atomicBool // 检测有数据
-	byteBuf    [1]byte    // 第一个数据，检测时候得到一个数据
-	cond       *sync.Cond // 组
-	inRead     atomicBool // 正在读取
-	aborted    atomicBool // 结束
-	inBackRead atomicBool // 当前是在后台读取
-	remain     int        // 限制读取
-	readLimit  bool
-}
-
-// 锁，条件等待
-func (T *connReader) lock() {
-	T.mu.Lock()
-	if T.cond == nil {
-		T.cond = sync.NewCond(&T.mu)
-	}
-}
-
-// 解锁
-func (T *connReader) unlock() { T.mu.Unlock() }
-
-// 设置读取限制
-//
-//	remain int	设置 0 默认限制为(math.MaxInt32)
-func (T *connReader) setReadLimit(remain int) {
-	if remain == 0 {
-		T.remain = math.MaxInt32
-		T.readLimit = false
-		return
-	}
-	T.remain = remain
-	T.readLimit = true
-}
-
-// 超出读取限制
-func (T *connReader) hitReadLimit() bool {
-	if !T.readLimit {
-		return false
-	}
-	return T.remain <= 0
-}
-
-// 后台读取
-func (T *connReader) backgroundRead() {
-	T.lock()
-	// T.aborted.isTrue() 终止后台读取，backgroundRead() 还没完全结束，再次进来无意义
-	// T.inRead.isTrue() 可能是后台读取 或 调用者读取，重复后台读取，也无意义
-	// T.hasByte.isTrue() 已经读取一位数据，再次后台读取更多位数据，也无意义
-	// T.conn.disableBackgroundRead	明确禁止后台读取
-	if T.aborted.isTrue() || T.inRead.isTrue() || T.hasByte.isTrue() || T.conn.disableBackgroundRead {
-		T.unlock()
-		return
-	}
-
-	T.inRead.setTrue()     // 1
-	T.inBackRead.setTrue() // 1
-	T.unlock()
-
-	var n int
-	var err error
-	T.conn.rwc.SetReadDeadline(time.Time{})
-	if T.conn.backgroundReadDiscard {
-		buf := make([]byte, 512)
-		for T.aborted.isFalse() { // 多线程，已经中止后，防止依然执行。
-			_, err = T.conn.rwc.Read(buf)
-			if err != nil {
-				break
-			}
-		}
-	} else if T.aborted.isFalse() { // 多线程，已经中止后，防止依然执行。
-		n, err = T.conn.rwc.Read(T.byteBuf[:])
-		if n == 1 {
-			T.hasByte.setTrue()
+// SetWriteBuffer 设置操作系统发送缓冲区大小（仅 TCP 连接有效）
+func (c *Conn) SetWriteBuffer(bytes int) error {
+	if !c.closed.Load() {
+		if tc, ok := c.rwc.(*net.TCPConn); ok {
+			return tc.SetWriteBuffer(bytes)
 		}
 	}
-
-	T.lock()
-	if ne, ok := err.(net.Error); ok && T.aborted.isTrue() && ne.Timeout() {
-		// 忽略这个错误。 这是另一个调用abortPendingRead的例程的预期错误。
-	} else if err != nil {
-		// 主动关闭连接，造成读取失败
-		T.conn.closeNotify(err)
-	}
-	T.inBackRead.setFalse() // 3
-	T.inRead.setFalse()     // 3
-	T.unlock()
-	T.cond.Broadcast()
-}
-
-// 中止后台读取
-func (T *connReader) abortBackgroundRead() {
-	T.lock()
-	if T.inBackRead.isTrue() {
-		T.unlock()
-		T.abortPendingRead()
-		return
-	}
-	T.unlock()
-}
-
-// 中止正在读取
-func (T *connReader) abortPendingRead() {
-	T.lock()
-	defer T.unlock()
-	if T.inRead.isFalse() {
-		return
-	}
-
-	T.aborted.setTrue() // 2
-	T.conn.rwc.SetReadDeadline(time.Unix(1, 0))
-	for T.inRead.isTrue() {
-		T.cond.Wait()
-	}
-	T.conn.rwc.SetReadDeadline(T.conn.readDeadline)
-	T.aborted.setFalse() // 4
-}
-
-// 读取数据
-func (T *connReader) Read(p []byte) (n int, err error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-
-	T.lock()
-	for T.inRead.isTrue() {
-		T.unlock()
-		T.abortPendingRead()
-		T.lock()
-	}
-
-	if T.hitReadLimit() {
-		T.unlock()
-		return 0, io.EOF
-	}
-
-	if T.readLimit && len(p) > T.remain {
-		p = p[:T.remain]
-	}
-
-	pt := p
-	hasByte := T.hasByte.isTrue()
-	if hasByte {
-		p[0] = T.byteBuf[0]
-		T.hasByte.setFalse()
-		if len(p) == 1 {
-			T.unlock()
-			T.remain--
-			return 1, nil
-		}
-		pt = p[1:]
-	}
-
-	T.inRead.setTrue() // 1
-	T.unlock()
-	n, err = T.conn.rwc.Read(pt[:])
-	T.inRead.setFalse() // 3
-	T.cond.Broadcast()  // 3
-	if hasByte {
-		n++
-		err = nil
-	}
-	if T.readLimit {
-		T.remain -= n
-	}
-	return n, err
-}
-
-func isCommonNetError(err error) bool {
-	nerr := err
-	if op, ok := nerr.(*net.OpError); ok {
-		if op.Timeout() {
-			return false
-		}
-		nerr = op.Err
-	}
-	if sys, ok := nerr.(*os.SyscallError); ok {
-		nerr = sys.Err
-	}
-
-	if isConnError(nerr) || nerr == io.EOF {
-		return true
-	}
-	//这里是常规错误，不使用
-	//switch se.Syscall {
-	//case "wsarecv", "wsasend", "wsarecvfrom", "wsasendto", "wsarecvmsg", "wsasendmsg":
-	//	fallthrough
-	//case "read", "write", "recvfrom", "write", "recvmsg", "sendmsg":
-	//	return true
-	//default:
-	//	return false
-	//}
-	return false
+	return nil
 }
