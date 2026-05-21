@@ -75,7 +75,7 @@ func (c *Conn) RawConn() net.Conn {
 	c.disableBackgroundRead.Store(true)
 
 	// 通知所有等待者连接已关闭
-	c.notifyClose(net.ErrClosed)
+	c.notifyClose(ErrRawConnAlreadyUsed)
 
 	return c.rwc
 }
