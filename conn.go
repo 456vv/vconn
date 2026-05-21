@@ -1,6 +1,7 @@
 package vconn
 
 import (
+	"context"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -76,9 +77,6 @@ func (c *Conn) RawConn() net.Conn {
 	// 通知所有等待者连接已关闭
 	c.notifyClose(net.ErrClosed)
 
-	// 中断后台读取协程
-	c.r.abortBackgroundRead()
-
 	return c.rwc
 }
 
@@ -142,6 +140,20 @@ func (c *Conn) CloseNotify() <-chan error {
 	return ch
 }
 
+func (c *Conn) WithContext(ctx context.Context) {
+	go c.waitCancel(ctx)
+}
+
+func (c *Conn) waitCancel(ctx context.Context) {
+	if ctx != nil {
+		select {
+		case <-c.CloseNotify():
+		case <-ctx.Done():
+			c.notifyClose(ctx.Err())
+		}
+	}
+}
+
 // IsClosed 返回连接是否已关闭
 func (c *Conn) IsClosed() bool {
 	return c.closed.Load()
@@ -157,15 +169,17 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 	n, err = c.r.Read(b)
 
 	// 如果发生网络错误，通知所有等待者
-	c.notifyClose(err)
-	if err == nil {
-		// 若前台 Read 顺利完成且连接依旧活跃，自动重新挂起后台监测协程
-		c.mu.RLock()
-		hasSignals := len(c.closeSignals) > 0
-		c.mu.RUnlock()
-		if hasSignals {
-			c.r.startBackgroundRead()
-		}
+	if isCommonNetError(err) {
+		c.notifyClose(err)
+		return
+	}
+
+	// 若前台 Read 顺利完成且连接依旧活跃，自动重新挂起后台监测协程
+	c.mu.RLock()
+	hasSignals := len(c.closeSignals) > 0
+	c.mu.RUnlock()
+	if hasSignals {
+		c.r.startBackgroundRead()
 	}
 	return
 }
@@ -179,7 +193,9 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 
 	n, err = c.rwc.Write(b)
 	// 如果发生网络错误，通知所有等待者
-	c.notifyClose(err)
+	if isCommonNetError(err) {
+		c.notifyClose(err)
+	}
 	return
 }
 
@@ -193,20 +209,14 @@ func (c *Conn) Close() error {
 
 	// 通知所有等待者
 	c.notifyClose(net.ErrClosed)
-
-	// 中断后台读取
-	c.r.abortBackgroundRead()
-
 	return c.rwc.Close()
 }
 
 // notifyClose 在探测到对端非正常断开时分发错误通知
 // 只有首次调用会真正通知，后续调用会被忽略
 func (c *Conn) notifyClose(err error) {
-	// 只处理网络错误
-	if !isCommonNetError(err) {
-		return
-	}
+	// 中断后台读取
+	c.r.abortBackgroundRead()
 
 	c.mu.Lock()
 	// 已经通知过，直接返回
