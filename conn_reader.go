@@ -129,7 +129,10 @@ func (r *connReader) backgroundReadLoop() {
 
 	// 如果是非中断退出且发生了网络异常，通知上层连接已关闭
 	if err != nil && !aborted {
-		r.conn.notifyClose(err)
+		// 只处理网络错误
+		if isCommonNetError(err) {
+			r.conn.notifyClose(err)
+		}
 	}
 }
 
