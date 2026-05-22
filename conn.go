@@ -140,6 +140,14 @@ func (c *Conn) CloseNotify() <-chan error {
 	return ch
 }
 
+// CancelNotify 取消所有等待的 CloseNotify 通知，参数 err 将作为通知内容发送给所有等待者
+// 返回值表示是否成功取消（即是否是首次调用）
+func (c *Conn) CancelNotify(err error) bool {
+	c.notifyClose(err)
+	return c.closeErr == err
+}
+
+// WithContext 将连接与上下文关联，在上下文取消时自动触发 CloseNotify 通知
 func (c *Conn) WithContext(ctx context.Context) {
 	go c.waitCancel(ctx)
 }
