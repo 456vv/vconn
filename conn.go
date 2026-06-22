@@ -32,6 +32,7 @@ type Conn struct {
 	rawReadUsed           atomic.Bool // 原始连接是否已被提取
 	disableBackgroundRead atomic.Bool // 是否禁用后台读取
 	backgroundReadDiscard atomic.Bool // 后台读取是否丢弃数据
+	backgroundReadBuffer  int
 }
 
 // New 包装原始连接。若已被包装，则直接返回本身
@@ -80,16 +81,13 @@ func (c *Conn) RawConn() net.Conn {
 	return c.rwc
 }
 
-// RawConnFull 归还原始连接，如果后台已经预读了 1 字节，会将其写回传入的 b 切片首位
+// RawConnFull 归还原始连接，如果后台已经预读了字节，会返回预读字节数据
 // 返回值：(原始连接, 预读字节数)
-func (c *Conn) RawConnFull(b []byte) (net.Conn, int) {
+func (c *Conn) RawConnFull() (net.Conn, []byte) {
 	if c.r.hasPeekedByte() {
-		if len(b) > 0 {
-			b[0] = c.r.peekedByte()
-		}
-		return c.RawConn(), 1
+		return c.RawConn(), c.r.peekedByte()
 	}
-	return c.RawConn(), 0
+	return c.RawConn(), nil
 }
 
 // SetBackgroundReadDiscard 设置后台读取是否丢弃数据
@@ -97,6 +95,10 @@ func (c *Conn) RawConnFull(b []byte) (net.Conn, int) {
 // false: 只预读 1 字节并缓存（默认模式）
 func (c *Conn) SetBackgroundReadDiscard(y bool) {
 	c.backgroundReadDiscard.Store(y)
+}
+
+func (c *Conn) SetBackgroundReadBuffer(n int) {
+	c.backgroundReadBuffer = n
 }
 
 // SetReadLimit 设置读取限制字节数
