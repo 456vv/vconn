@@ -38,6 +38,10 @@ type Conn struct {
 // New 包装原始连接。若已被包装，则直接返回本身
 // 参数 c 不能为 nil，否则会 panic
 func New(c net.Conn) *Conn {
+	return NewData(c, nil)
+}
+
+func NewData(c net.Conn, b []byte) *Conn {
 	if c == nil {
 		panic("vconn: nil conn")
 	}
@@ -47,15 +51,16 @@ func New(c net.Conn) *Conn {
 	}
 	conn := &Conn{rwc: c}
 	conn.r = newConnReader(conn)
+	if len(b) > 0 {
+		conn.r.peekByte = make([]byte, len(b))
+		copy(conn.r.peekByte, b)
+		conn.r.peeked.Store(true)
+	}
+
 	// 初始化 deadline 为零值
 	conn.readDeadline.Store(time.Time{})
 	conn.writeDeadline.Store(time.Time{})
 	return conn
-}
-
-// NewConn 是 New 的别名，返回 net.Conn 接口
-func NewConn(c net.Conn) net.Conn {
-	return New(c)
 }
 
 // RawConn 剥离包装，归还底层真实连接
