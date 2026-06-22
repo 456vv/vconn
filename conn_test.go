@@ -76,7 +76,7 @@ func TestConn_Read_2(t *testing.T) {
 		}
 		defer netConn.Close()
 
-		netConn = NewConn(netConn)
+		netConn = New(netConn)
 		go func() {
 			p := make([]byte, 8)
 			for {
