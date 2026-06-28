@@ -76,7 +76,7 @@ func TestConn_Read_2(t *testing.T) {
 		}
 		defer netConn.Close()
 
-		netConn = NewConn(netConn)
+		netConn = New(netConn)
 		go func() {
 			p := make([]byte, 8)
 			for {
@@ -254,15 +254,15 @@ func TestConn_RawConn(t *testing.T) {
 		vc := New(c)
 		ch := vc.CloseNotify() // start background
 		time.Sleep(100 * time.Millisecond)
-		raw, peeked := vc.RawConnFull(make([]byte, 1))
-		if peeked != 1 {
+		raw, peeked := vc.RawConnFull()
+		if len(peeked) != 1 {
 			t.Error("unexpected peek")
 		}
 		defer raw.Close()
 		// 等待后台读结束
 		select {
 		case e := <-ch:
-			if e != net.ErrClosed {
+			if e != ErrRawConnAlreadyUsed {
 				t.Errorf("expected close, got %v", e)
 			}
 		case <-time.After(2 * time.Second):
@@ -467,7 +467,7 @@ func TestConn_RawConnExtraction(t *testing.T) {
 
 	select {
 	case err := <-notify:
-		if !errors.Is(err, net.ErrClosed) {
+		if !errors.Is(err, ErrRawConnAlreadyUsed) {
 			t.Errorf("Expected notify channel to close with net.ErrClosed, got %v", err)
 		}
 	default:
@@ -500,12 +500,11 @@ func TestConn_RawConnFullPeeked(t *testing.T) {
 	}()
 	time.Sleep(100 * time.Millisecond)
 
-	out := make([]byte, 1)
-	raw, peeked := vc.RawConnFull(out)
+	raw, peeked := vc.RawConnFull()
 	defer raw.Close()
 
-	if peeked != 1 || out[0] != 'X' {
-		t.Errorf("Failed to capture peeked byte. Got peeked=%d, byte=%q", peeked, out[0])
+	if len(peeked) != 1 || peeked[0] != 'X' {
+		t.Errorf("Failed to capture peeked byte. Got peeked=%d", peeked[0])
 	}
 }
 
@@ -626,10 +625,9 @@ func TestConn_RawConnFull(t *testing.T) {
 	// 给一点点时间让后台协程读取到 A
 	time.Sleep(50 * time.Millisecond)
 
-	buf := make([]byte, 10)
-	raw, n := vc.RawConnFull(buf)
-	if n != 1 || buf[0] != 'A' {
-		t.Fatalf("RawConnFull failed to recover peeked byte: n=%d, val=%c", n, buf[0])
+	raw, buf := vc.RawConnFull()
+	if len(buf) != 1 || buf[0] != 'A' {
+		t.Fatalf("RawConnFull failed to recover peeked byte: val=%c", buf[0])
 	}
 
 	// 验证 raw 是否正常工作
@@ -637,5 +635,29 @@ func TestConn_RawConnFull(t *testing.T) {
 	raw.Read(buf)
 	if buf[0] != 'B' {
 		t.Fatalf("Raw connection read failed")
+	}
+}
+
+func TestConn_SetBackgroundReadBuffer(t *testing.T) {
+	s, c := net.Pipe()
+	defer s.Close()
+
+	vc := New(c)
+	defer vc.Close()
+	vc.SetBackgroundReadBuffer(10) // 设置背景读取缓冲区大小为 10 字节
+	vc.CloseNotify()
+
+	s.SetWriteDeadline(time.Now().Add(time.Second))
+	n, err := s.Write([]byte("hello world"))
+	if n != 10 {
+		t.Fatalf("Write failed, n=%d, err=%v", n, err)
+	}
+	if err == nil {
+		t.Fatalf("Write should have failed due to deadline, got %v", err)
+	}
+	conn, buf := vc.RawConnFull()
+	conn.Close()
+	if !bytes.Equal(buf, []byte("hello worl")) {
+		t.Fatalf("RawConnFull failed to recover peeked bytes: val=%s", string(buf))
 	}
 }

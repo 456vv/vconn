@@ -16,7 +16,7 @@ type connReader struct {
 	cond *sync.Cond // 用于等待后台读取退出
 
 	peeked   atomic.Bool // 是否已预读到 1 字节
-	peekByte byte        // 缓存的预读字节（受 mu 保护）
+	peekByte []byte      // 缓存的预读字节（受 mu 保护）
 
 	inRead  atomic.Bool // 标志当前是否有活跃的读取流程（前台或后台）
 	aborted atomic.Bool // 标志后台预读是否正处于中断恢复流程
@@ -49,9 +49,11 @@ func (r *connReader) hasPeekedByte() bool {
 
 // peekedByte 返回预读的字节
 // 调用前应先检查 hasPeekedByte()
-func (r *connReader) peekedByte() byte {
+func (r *connReader) peekedByte() []byte {
 	r.mu.Lock()
 	b := r.peekByte
+	r.peekByte = nil
+	r.peeked.Store(false)
 	r.mu.Unlock()
 	return b
 }
@@ -60,7 +62,7 @@ func (r *connReader) peekedByte() byte {
 // 线程安全，可重复调用（会自动去重）
 func (r *connReader) startBackgroundRead() {
 	// 如果连接已关闭或后台读取被禁用，无需启动
-	if r.conn.disableBackgroundRead.Load() || r.conn.IsClosed() {
+	if r.conn.disableBackgroundRead.Load() || r.conn.backgroundReadBuffer < 0 || r.conn.IsClosed() {
 		return
 	}
 
@@ -96,6 +98,7 @@ func (r *connReader) backgroundReadLoop() {
 	r.mu.Unlock()
 
 	var err error
+	var n int
 	if r.conn.backgroundReadDiscard.Load() {
 		// 丢弃模式：循环读取并扔掉数据，直到出错或被中断
 		buf := make([]byte, 4096) // 使用较大缓冲区提升性能
@@ -105,14 +108,35 @@ func (r *connReader) backgroundReadLoop() {
 				break
 			}
 		}
-	} else if !r.aborted.Load() && !r.conn.IsClosed() {
-		// 预读模式：仅读取 1 字节存入缓存
-		p := []byte{0}
-		var n int
-		n, err = r.conn.rwc.Read(p)
-		if n == 1 {
+	} else if r.conn.backgroundReadBuffer > 0 {
+		// 预读模式：仅读取指定字节存入缓存区，直到出错或被中断或缓存已满
+		buf := make([]byte, r.conn.backgroundReadBuffer)
+		for !r.aborted.Load() && !r.conn.IsClosed() {
 			r.mu.Lock()
-			r.peekByte = p[0]
+			lpb := len(r.peekByte)
+			remainSize := r.conn.backgroundReadBuffer - lpb
+			r.mu.Unlock()
+			if lpb >= r.conn.backgroundReadBuffer {
+				break
+			}
+			n, err = r.conn.rwc.Read(buf[:remainSize])
+			if n > 0 {
+				r.mu.Lock()
+				r.peekByte = append(r.peekByte, buf[:n]...)
+				r.peeked.Store(true)
+				r.mu.Unlock()
+			}
+			if err != nil {
+				break
+			}
+		}
+	} else if !r.aborted.Load() && !r.conn.IsClosed() {
+		// 预读模式，但未设置缓存大小，仅读取一个字节
+		buf := make([]byte, 1)
+		n, err = r.conn.rwc.Read(buf)
+		if n > 0 {
+			r.mu.Lock()
+			r.peekByte = append(r.peekByte, buf[0])
 			r.peeked.Store(true)
 			r.mu.Unlock()
 		}
@@ -192,24 +216,29 @@ func (r *connReader) Read(p []byte) (n int, err error) {
 	}
 
 	r.mu.Lock()
-	// 2. 优先消费后台已预读出的那 1 个字节
+	// 2. 优先消费后台已预读出字节
 	// 读取旧的标志并设置新的标志
-	if r.peeked.Swap(false) {
-		p[0] = r.peekByte
+	if r.peeked.Load() {
+		pl := min(len(p), len(r.peekByte))
+		n = copy(p[:pl], r.peekByte[:pl])
+		r.peekByte = r.peekByte[n:]
 
-		// 如果只需要 1 字节，直接返回
-		if len(p) == 1 {
+		if len(r.peekByte) == 0 {
+			r.peeked.Store(false)
+		}
+
+		// 如果只需要相同长度字节，直接返回
+		if len(p) == pl {
 			r.mu.Unlock()
 			// 扣减限流配额
 			if limit > 0 {
-				r.readLimit.Add(-1)
+				r.readLimit.Add(-int64(n))
 			}
-			return 1, nil
+			return n, nil
 		}
 
 		// 继续读取剩余部分
-		p = p[1:]
-		n = 1
+		p = p[n:]
 	}
 
 	// 检查连接状态
