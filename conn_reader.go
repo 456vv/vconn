@@ -62,7 +62,7 @@ func (r *connReader) peekedByte() []byte {
 // 线程安全，可重复调用（会自动去重）
 func (r *connReader) startBackgroundRead() {
 	// 如果连接已关闭或后台读取被禁用，无需启动
-	if r.conn.disableBackgroundRead.Load() || r.conn.IsClosed() {
+	if r.conn.disableBackgroundRead.Load() || r.conn.backgroundReadBuffer < 0 || r.conn.IsClosed() {
 		return
 	}
 
@@ -219,10 +219,7 @@ func (r *connReader) Read(p []byte) (n int, err error) {
 	// 2. 优先消费后台已预读出字节
 	// 读取旧的标志并设置新的标志
 	if r.peeked.Load() {
-		pl := len(r.peekByte)
-		if len(p) < pl {
-			pl = len(p)
-		}
+		pl := min(len(p), len(r.peekByte))
 		n = copy(p[:pl], r.peekByte[:pl])
 		r.peekByte = r.peekByte[n:]
 
