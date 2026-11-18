@@ -1,195 +1,107 @@
 package vconn
 
 import (
+	"errors"
 	"io"
+	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// connReader 负责协调后台预读与前台用户主动读取的冲突与转换
-// 所有方法均为并发安全
+// connReader 负责协调前台读取与后台预读：
+//   - 前台读用 fg 串行化，多个 goroutine 并发 Read 不会互相打断；
+//   - 预读只在连接空闲且无人读取时（fg.TryLock 成功）进行；
+//   - 预读使用自身超时，结束后按最新快照恢复调用方的 ReadDeadline；
+//   - 读取限制用 CAS 扣减，并发下不会超发。
+//
+// 三条内部不变量（修改时必须保持）：
+//  1. r.peek 的读写只发生在 peekMu 临界区内；不使用可能与切片不同步的原子标志
+//     （标志与切片不同步会导致字节乱序交付或数据滞留）；
+//  2. 任何一次可能阻塞的 socket 读，都必须在 deadlineMu 内
+//     「先置位 peekBusy，再写自身 deadline」，保证 stopMonitor 一定能唤醒它；
+//  3. 后台预读的「是否该退出」由传入的 stop 句柄（本轮 monitorRun.quit）决定，
+//     不使用 c.mon 反查（换代瞬间反查会认错实例）。
 type connReader struct {
 	conn *Conn
 
-	mu   sync.Mutex // 保护 peekByte 和状态转换
-	cond *sync.Cond // 用于等待后台读取退出
+	fg sync.Mutex // 串行化所有前台读（含预读字节消费）
 
-	peeked   atomic.Bool // 是否已预读到 1 字节
-	peekByte []byte      // 缓存的预读字节（受 mu 保护）
+	peekMu sync.Mutex
+	peek   []byte
 
-	inRead  atomic.Bool // 标志当前是否有活跃的读取流程（前台或后台）
-	aborted atomic.Bool // 标志后台预读是否正处于中断恢复流程
+	peekTmp  []byte      // 预读临时缓冲，复用避免反复分配
+	peekBusy atomic.Bool // 是否正处于阻塞式预读中（此时独占 fg 锁）
+	// noDeadline 底层 SetReadDeadline 已被证实不可用。
+	// 一旦置位，后台预读永久跳过（安全优先：不可中断的阻塞读会拖住监控与 Close），
+	// 同时避免每轮白白发起两次注定失败的 syscall。
+	noDeadline atomic.Bool
 
-	readLimit atomic.Int64 // 限流字节数: -1 表示无限制，>= 0 表示剩余可用配额
+	pending   error // 上次读取遗留的错误（数据与错误分两次返回）
+	readLimit atomic.Int64
 }
 
 func newConnReader(c *Conn) *connReader {
 	r := &connReader{conn: c}
-	r.cond = sync.NewCond(&r.mu)
 	r.readLimit.Store(-1) // 默认不限流
 	return r
 }
 
 // setReadLimit 设置读取限制。-1 为不限制，>=0 限制具体长度
-// 线程安全
 func (r *connReader) setReadLimit(remain int64) {
 	if remain < 0 {
 		r.readLimit.Store(-1)
-	} else {
-		r.readLimit.Store(remain)
+		return
 	}
+	r.readLimit.Store(remain)
 }
 
-// hasPeekedByte 返回是否已预读到 1 字节
-// 线程安全
-func (r *connReader) hasPeekedByte() bool {
-	return r.peeked.Load()
-}
-
-// peekedByte 返回预读的字节
-// 调用前应先检查 hasPeekedByte()
-func (r *connReader) peekedByte() []byte {
-	r.mu.Lock()
-	b := r.peekByte
-	r.peekByte = nil
-	r.peeked.Store(false)
-	r.mu.Unlock()
+// takePeek 原子地取走预读缓冲区
+func (r *connReader) takePeek() []byte {
+	r.peekMu.Lock()
+	b := r.peek
+	r.peek = nil
+	r.peekMu.Unlock()
 	return b
 }
 
-// startBackgroundRead 安全拉起一个后台预读协程
-// 线程安全，可重复调用（会自动去重）
-func (r *connReader) startBackgroundRead() {
-	// 如果连接已关闭或后台读取被禁用，无需启动
-	if r.conn.disableBackgroundRead.Load() || r.conn.backgroundReadBuffer < 0 || r.conn.IsClosed() {
+// pushPeek 把字节压入预读缓冲区
+//
+// 这是唯一不被 fg 保护的追加路径（NewData 对已存在 Conn 的补充），
+// 因此必须在 peekMu 内完成"追加"的全部动作，保证前台读看到的数据
+// 与切片内容严格一致。
+func (r *connReader) pushPeek(b []byte) {
+	if len(b) == 0 {
 		return
 	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// 若当前有读操作正在运行、已存在预读数据或正处于中断流程，无需重复启动
-	if r.inRead.Load() || r.peeked.Load() || r.aborted.Load() {
-		return
-	}
-
-	r.inRead.Store(true)
-	go r.backgroundReadLoop()
+	r.peekMu.Lock()
+	r.peek = append(r.peek, b...)
+	r.peekMu.Unlock()
 }
 
-// backgroundReadLoop 执行后台阻塞读，用于捕获远端主动断开事件
-// 该方法在独立 goroutine 中运行
-func (r *connReader) backgroundReadLoop() {
-	// 这里上锁防止多线程环境下，调用 backgroundReadLoop() 和 abortBackgroundRead() 设置了混乱的时间。
-	r.mu.Lock()
-	if r.conn.IsClosed() || r.aborted.Load() {
-		r.inRead.Store(false)
-		r.mu.Unlock()
-		// 由于调用 abortBackgroundRead() 的时候会等待后台读取完全退出
-		// 可能 backgroundReadLoop() 在等待锁的过程中，优先 abortBackgroundRead() 执行了 r.cond.Wait() 等待退出，此时需要唤醒等待，否则会造成死锁。
-		r.cond.Broadcast()
-		return
-	}
-
-	// 取消前台读取的任何超时设置，确保后台读取以阻塞方式等待数据或对端关闭
-	// 这里不检查错误，因为连接可能已关闭
-	r.conn.rwc.SetReadDeadline(time.Time{})
-	r.mu.Unlock()
-
-	var err error
-	var n int
-	if r.conn.backgroundReadDiscard.Load() {
-		// 丢弃模式：循环读取并扔掉数据，直到出错或被中断
-		buf := make([]byte, 4096) // 使用较大缓冲区提升性能
-		for !r.aborted.Load() && !r.conn.IsClosed() {
-			_, err = r.conn.rwc.Read(buf)
-			if err != nil {
-				break
-			}
-		}
-	} else if r.conn.backgroundReadBuffer > 0 {
-		// 预读模式：仅读取指定字节存入缓存区，直到出错或被中断或缓存已满
-		buf := make([]byte, r.conn.backgroundReadBuffer)
-		for !r.aborted.Load() && !r.conn.IsClosed() {
-			r.mu.Lock()
-			lpb := len(r.peekByte)
-			remainSize := r.conn.backgroundReadBuffer - lpb
-			r.mu.Unlock()
-			if lpb >= r.conn.backgroundReadBuffer {
-				break
-			}
-			n, err = r.conn.rwc.Read(buf[:remainSize])
-			if n > 0 {
-				r.mu.Lock()
-				r.peekByte = append(r.peekByte, buf[:n]...)
-				r.peeked.Store(true)
-				r.mu.Unlock()
-			}
-			if err != nil {
-				break
-			}
-		}
-	} else if !r.aborted.Load() && !r.conn.IsClosed() {
-		// 预读模式，但未设置缓存大小，仅读取一个字节
-		buf := make([]byte, 1)
-		n, err = r.conn.rwc.Read(buf)
-		if n > 0 {
-			r.mu.Lock()
-			r.peekByte = append(r.peekByte, buf[0])
-			r.peeked.Store(true)
-			r.mu.Unlock()
-		}
-	}
-
-	// 标记读取完成
-	r.mu.Lock()
-	r.inRead.Store(false)
-	aborted := r.aborted.Load() // 记录是否为中断退出
-	r.mu.Unlock()
-
-	// 唤醒所有可能在等待后台读取退出的协程
-	r.cond.Broadcast()
-
-	// 如果是非中断退出且发生了网络异常，通知上层连接已关闭
-	if err != nil && !aborted {
-		// 只处理网络错误
-		if isCommonNetError(err) {
-			r.conn.notifyClose(err)
-		}
-	}
+// hasPeek 报告预读缓冲区里是否还有尚未被调用方读走的字节。
+func (r *connReader) hasPeek() bool {
+	r.peekMu.Lock()
+	defer r.peekMu.Unlock()
+	return len(r.peek) > 0
 }
 
-// abortBackgroundRead 安全地强行中断正在运行的后台读取协程
-// 该方法会阻塞直到后台读取完全退出
-// 线程安全
-func (r *connReader) abortBackgroundRead() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// 没有后台读取在运行，直接返回
-	if !r.inRead.Load() {
+// consumeLimit 原子扣减读取配额
+func (r *connReader) consumeLimit(n int, limit int64) {
+	if limit <= 0 || n <= 0 {
 		return
 	}
-
-	// 标记为中断状态
-	r.aborted.Store(true)
-
-	// 设置极小超时（过去的Unix时间戳），强行逼退底层阻塞的 Read 系统调用
-	r.conn.rwc.SetReadDeadline(time.Unix(0, 1))
-
-	// 阻塞等待后台读取协程完全退出
-	for r.inRead.Load() {
-		r.cond.Wait()
+	for {
+		cur := r.readLimit.Load()
+		if cur <= 0 {
+			return
+		}
+		next := max(cur-int64(n), 0)
+		if r.readLimit.CompareAndSwap(cur, next) {
+			return
+		}
 	}
-
-	// 恢复用户原先设置的前台读取超时时间
-	if deadline, ok := r.conn.readDeadline.Load().(time.Time); ok {
-		_ = r.conn.rwc.SetReadDeadline(deadline)
-	}
-
-	// 清除中断标志
-	r.aborted.Store(false)
 }
 
 // Read 实现流式读取，具备限流、预读字节消费等复合功能
@@ -199,74 +111,393 @@ func (r *connReader) Read(p []byte) (n int, err error) {
 		return 0, nil
 	}
 
+	r.fg.Lock()
+	defer r.fg.Unlock()
+
+	// 上次读取遗留的错误（如 EOF），在没有新数据时补交给调用方
+	if r.pending != nil {
+		err = r.pending
+		r.pending = nil
+		// 同样经过连接级规整：pending 可能是 net.ErrClosed，而对端实际是异常断开
+		// （真实原因已被探测路径从 SO_ERROR 读走），这条路径不能漏掉 ECONNRESET。
+		if term := r.conn.terminalReadErr(err); term != nil {
+			return 0, term
+		}
+		return 0, err
+	}
+
 	// 1. 处理 Read Limit 限流控制
 	limit := r.readLimit.Load()
 	if limit == 0 {
 		return 0, io.EOF
 	}
-
-	// 限制本次读取长度
 	if limit > 0 && int64(len(p)) > limit {
 		p = p[:limit]
 	}
 
-	// 若当前后台协程正在霸占读取，先将其踢出并等待其彻底退出
-	for r.inRead.Load() {
-		r.abortBackgroundRead()
+	// 2. 优先消费后台已预读的字节。
+	//
+	// 这里不使用原子标志做快路径：标志与切片可能不同步，会让「看到的数据」
+	// 与「交付的数据」不一致（乱序或滞留）。peekMu 是未竞争互斥锁（约 15ns），
+	// 换取严格一致性。
+	r.peekMu.Lock()
+	if len(r.peek) > 0 {
+		cn := copy(p, r.peek)
+		r.peek = r.peek[cn:]
+		if len(r.peek) == 0 {
+			r.peek = nil
+		}
+		n += cn
+		p = p[cn:]
+	}
+	r.peekMu.Unlock()
+
+	if len(p) == 0 {
+		r.consumeLimit(n, limit)
+		return n, nil
 	}
 
-	r.mu.Lock()
-	// 2. 优先消费后台已预读出字节
-	// 读取旧的标志并设置新的标志
-	if r.peeked.Load() {
-		pl := min(len(p), len(r.peekByte))
-		n = copy(p[:pl], r.peekByte[:pl])
-		r.peekByte = r.peekByte[n:]
-
-		if len(r.peekByte) == 0 {
-			r.peeked.Store(false)
+	// 3. 已关闭则直接返回（注意：预读字节已在上面交付，不会被丢弃）
+	if r.conn.closed.Load() {
+		r.consumeLimit(n, limit)
+		if n > 0 {
+			return n, nil
 		}
+		return 0, net.ErrClosed
+	}
 
-		// 如果只需要相同长度字节，直接返回
-		if len(p) == pl {
-			r.mu.Unlock()
-			// 扣减限流配额
-			if limit > 0 {
-				r.readLimit.Add(-int64(n))
+	// 4. 真实网络读取（前台独占，不会被后台预读打断）
+	rn, rerr := r.conn.rwc.Read(p)
+	n += rn
+	if rn > 0 {
+		// 无条件计数：监控启动前的读也必须计入，否则首轮会把活跃连接误判为空闲。
+		//
+		// 注意：这里故意**不**统计「仅消费预读缓冲」的读取。readSeq 的语义是
+		// "内核 socket 上最近有没有读活动"，用于决定监控是否值得做零消耗内核探测。
+		r.conn.readSeq.Add(1)
+	}
+	// 注意：这里必须按本次返回的总字节数 n 扣减。
+	// n 可能包含「预读缓冲区消费的 cn + 底层读到的 rn」，只扣 rn 会让
+	// SetReadLimit 被预读字节绕过（上限变成 limit+len(peek)）。
+	r.consumeLimit(n, limit)
+
+	if rerr != nil {
+		if n > 0 {
+			// 已有数据：先返回数据，错误留到下一次，避免调用方丢弃最后一段数据。
+			// 除超时外的错误都要留存（超时是控制流，重放没有意义）。
+			if !isTimeoutErr(rerr) {
+				r.pending = rerr
 			}
 			return n, nil
 		}
+		// 结束原因规整：探测路径可能已经把 SO_ERROR 读走，
+		// 这里用连接级结论替换底层那个"干净"的 EOF，避免 ECONNRESET 被降级。
+		if term := r.conn.terminalReadErr(rerr); term != nil {
+			return 0, term
+		}
+		return 0, rerr
+	}
+	return n, nil
+}
 
-		// 继续读取剩余部分
-		p = p[n:]
+// resolvePeekBlock 决定本次预读该怎么做。
+//
+// 返回值含义：
+//
+//	skip=true               → 本次不读，调用方直接返回 (false, nil)
+//	skip=false, block=true  → 读（等待型探测）
+//	skip=false, block=false → 读（内核已确认可读）
+//
+// 注意：block 不再是"要不要设超时"的开关 —— 所有后台/探活读一律带自身超时
+// （poll 与 Read 之间数据可能被前台读消费，无超时的 Read 会永久阻塞并占用 fg）。
+// block 仅用于表达"本次是否属于等待型探测"的语义。
+//
+// 四种探测结果的处理规则：
+//
+//	probeReadable（有数据可读）
+//	  直接连接（*net.TCPConn 等）      → 读
+//	  非直接连接（*tls.Conn 等包装）   → 跳过（读到的是密文，会破坏 TLS 记录边界）
+//
+//	probeReadableHangup（有数据 + 对端已 FIN）
+//	  同 probeReadable：数据可读且必须可读，跳过会让数据卡在内核里
+//
+//	probeIdle（无数据但连接存活）
+//	  直接连接 + 允许阻塞              → 读（等待型探测）
+//	  其它                             → 跳过（没有可观察的就绪事件）
+//
+//	probeUnsupported（拿不到 fd，无法内核探测）
+//	  isBlockProbeSafe(c)              → 读（等待型探测）
+//	    · 直接 syscall.Conn / 叶子连接（net.Pipe、内存管道）
+//	    · 显式实现 SafeBlockProber 并返回 true
+//	  其它（包装型连接，如 TLS wrapper）→ 跳过（安全优先）
+func resolvePeekBlock(c net.Conn, res probeResult, allowBlock bool) (skip, block bool) {
+	direct := isDirectSyscallConn(c)
+	switch res {
+	case probeReadable, probeReadableHangup:
+		if !direct {
+			return true, false
+		}
+		return false, false
+	case probeIdle:
+		if !direct || !allowBlock {
+			return true, false
+		}
+		return false, true
+	default: // probeUnsupported
+		if isBlockProbeSafe(c) {
+			return false, true
+		}
+		return true, false
+	}
+}
+
+// peekStep 执行一次后台预读（或丢弃）动作。
+// 返回 closed=true 表示探测到连接已关闭（err 为原因）。
+//
+// stop 为**本轮监控实例**的退出信号（monitorRun.quit）。发起阻塞读之前必须先
+// 检查它，否则监控换代时旧实例仍会发起新的阻塞读，无谓拖长 stopMonitor。
+//
+// res 为上一步内核探测的结果；allowBlock 为 true 时允许一次等待型探测。
+//
+// 关键约束：
+//   - 只在 fg 可获取（无前台读）时执行，绝不干扰前台读；
+//   - 预读模式的缓冲长度严格等于缺口 want（绝不越配额多读）；
+//     丢弃模式按 |n| 决定单次读取长度（不足 minPeekBuf 按 minPeekBuf），一次吞掉更多；
+//   - 任何一次 socket 读都带自身超时
+//     结束后恢复调用方设置的 ReadDeadline。
+func (r *connReader) peekStep(stop <-chan struct{}, res probeResult, allowBlock bool) (closed bool, err error) {
+	size := int(r.conn.peekSize.Load())
+	if size == 0 || r.conn.closed.Load() {
+		return false, nil
 	}
 
-	// 检查连接状态
-	if r.conn.IsClosed() {
-		r.mu.Unlock()
-		return n, io.EOF
+	discard := size < 0
+	// 丢弃模式下 want 保持负值：既表示「丢弃」（discard），其绝对值又是本次读取的
+	// 缓冲长度（由 tmpBuf 消解负号）。预读模式必须扣掉已有预读量，避免越配额多读。
+	want := size
+	if !discard {
+		r.peekMu.Lock()
+		have := len(r.peek)
+		r.peekMu.Unlock()
+		if have >= want {
+			return false, nil // 预读缓冲已满，等前台消费
+		}
+		want -= have
 	}
 
-	// 3. 锁定状态，准备发起前台真实网络读取
-	r.inRead.Store(true)
-	r.mu.Unlock()
-
-	// 执行真实读取（在锁外，避免阻塞其他操作）
-	var rn int
-	rn, err = r.conn.rwc.Read(p)
-
-	// 标记读取完成
-	r.mu.Lock()
-	r.inRead.Store(false)
-	r.mu.Unlock()
-	r.cond.Broadcast()
-
-	n += rn
-
-	// 扣减限流配额
-	if limit > 0 && n > 0 {
-		r.readLimit.Add(-int64(n))
+	skip, _ := resolvePeekBlock(r.conn.rwc, res, allowBlock)
+	if skip {
+		// 表示不用预读
+		return false, nil
 	}
 
-	return n, err
+	// 前台正在读，让路（不会造成任何延迟）
+	if !r.fg.TryLock() {
+		return false, nil
+	}
+	defer r.fg.Unlock()
+
+	// 统一带自身超时：即使内核已报"可读"，poll 与 Read 之间数据仍可能被前台读
+	// 消费掉（fg 是在 poll 之后才拿到的），无超时的 Read 会永久阻塞并一直占着 fg，
+	// 让所有前台 Read 饿死。
+	return r.peekRead(stop, want, discard, peekTimeout)
+}
+
+// peekProbe 执行一次「最小化」后台预读：单次最多读取 1 字节，
+// 供 CheckAliveBlocking 这类高频探测场景使用，避免一次性填满预读缓冲。
+//
+// size 为本次探测可用的预读额度（由 Conn.peekProbeBudget 决定）：
+// 它只影响本次调用，不会写回连接状态。
+//
+// 与 peekStep 的差异：
+//   - 单次读长度固定为 1（peekStep 预读模式读 want = size-have）；
+//   - 预读模式下若 peek 缓冲已达 size 上限，视为「有未读数据 = 连接存活」，
+//     直接返回 false（不阻塞、不报错、不再读）——这是「多次调用不造成缓冲满误判」的关键；
+//   - 丢弃模式下按 1 字节丢弃，不按 minPeekBuf 放大（避免高频探测吞掉大段数据）；
+//     注意：丢弃模式已被 Conn.peekProbeBudget 挡在门外（返回 0 → 不调用本函数），
+//     这里的支持仅为防御性保留；
+//   - stop 传 nil：用户态探活不受监控换代影响，且自身超时保证可被唤醒。
+//
+// 返回 closed=true 表示探测到对端关闭；err 为原因。
+func (r *connReader) peekProbe(res probeResult, allowBlock bool, size int) (closed bool, err error) {
+	if size == 0 || r.conn.closed.Load() {
+		return false, nil
+	}
+	discard := size < 0
+
+	// 预读模式：缓冲已达上限 → 有未消费数据 → 连接必然存活，不再读取。
+	// 丢弃模式 have 恒为 0，不参与此判断。
+	if !discard {
+		r.peekMu.Lock()
+		have := len(r.peek)
+		r.peekMu.Unlock()
+		if have >= size {
+			return false, nil
+		}
+	}
+
+	skip, _ := resolvePeekBlock(r.conn.rwc, res, allowBlock)
+	if skip {
+		// 表示不用预读
+		return false, nil
+	}
+
+	// 前台正在读，让路：前台读本身是连接活着的证据
+	if !r.fg.TryLock() {
+		return false, nil
+	}
+	defer r.fg.Unlock()
+
+	done, derr := r.peekRead(nil, 1, discard, peekTimeout)
+	if done && r.conn.closed.Load() {
+		// 本地已关闭（并发 Close/RawConn）：这不是"对端结论"，
+		// 交给下一次 checkKernel 以 net.ErrClosed 如实上报。
+		return false, nil
+	}
+	return done, derr
+}
+
+// peekRead 读取一批数据放入预读缓冲区（discard=true 时丢弃）。
+//
+// 不变量（务必保持）：只要本函数会碰 socket，就一定要
+//  1. 在 deadlineMu 内判定"是否该退出"；
+//  2. 在 deadlineMu 内置位 peekBusy；
+//  3. 在 deadlineMu 内写入自身 deadline；
+//  4. 函数返回前清除 peekBusy 并恢复调用方的 ReadDeadline。
+//
+// 这样 stopMonitor 只要看到 peekBusy=true，其"过去时间"的 deadline 就一定晚于
+// 本次设置，从而必定能唤醒这次读；反过来，任何一次后台读都不会永久阻塞。
+//
+// timeout<=0 时按 peekReadTimeout 兜底（调用方一律显式传值，此处仅为防御）。
+//
+// 若底层连接不支持 deadline（SetReadDeadline 返回错误），则放弃本次阻塞预读：
+// 否则这个后台读可能永远阻塞，把监控协程（甚至 Close/RawConnFull）一起拖住。
+func (r *connReader) peekRead(stop <-chan struct{}, want int, discard bool, timeout time.Duration) (closed bool, err error) {
+	if timeout <= 0 {
+		timeout = peekReadTimeout
+	}
+	if r.noDeadline.Load() {
+		// 该连接已证实不支持 deadline：不做后台读（没有可中断手段）。
+		// 内核探测路径仍然生效，关闭检测不受影响。
+		return false, nil
+	}
+	buf := r.tmpBuf(want)
+
+	r.conn.deadlineMu.Lock()
+	if r.conn.closed.Load() {
+		r.conn.deadlineMu.Unlock()
+		return false, nil
+	}
+	if stop != nil {
+		select {
+		case <-stop:
+			// 本轮监控已被要求退出（关闭通知已落定 / RawConn / ResetNotify）：
+			// 此时再发起阻塞预读只会白白拖延 stopMonitor，直接放弃本次预读。
+			r.conn.deadlineMu.Unlock()
+			return false, nil
+		default:
+		}
+	}
+	r.peekBusy.Store(true)
+	derr := r.conn.rwc.SetReadDeadline(time.Now().Add(timeout))
+	r.conn.deadlineMu.Unlock()
+
+	if derr != nil {
+		r.peekBusy.Store(false)
+		// 连接已经处于终态时（net.Pipe 在 localDone/remoteDone 关闭后
+		// 会直接从 SetReadDeadline 返回 io.ErrClosedPipe），必须如实上报，
+		// 不能当成「无法探测」而放过——否则关闭通知永远不会触发。
+		if errors.Is(derr, io.ErrClosedPipe) || errors.Is(derr, net.ErrClosed) {
+			if !discard && r.hasPeek() {
+				return true, peerClosedWithUnreadError{}
+			}
+			return true, io.EOF
+		}
+		// 其它情况（底层不支持 deadline）：无法保证可中断，直接跳过本次阻塞预读，
+		// 并记为永久不可用，之后不再重试（避免每轮浪费两次注定失败的 syscall）。
+		r.noDeadline.Store(true)
+		return false, nil
+	}
+	defer func() {
+		r.peekBusy.Store(false)
+		r.conn.deadlineMu.Lock()
+		r.conn.rwc.SetReadDeadline(r.conn.readDeadline)
+		r.conn.deadlineMu.Unlock()
+	}()
+
+	n, rerr := r.conn.rwc.Read(buf)
+	if n > 0 {
+		if !discard {
+			r.peekMu.Lock()
+			// 注意：这里 append 的是已经从内核取出的字节，任何情况下都不得裁剪
+			// （裁剪即丢数据）。并发 NewData 可能使长度短暂超过 SetBackgroundReadBuffer
+			// 设定的上限，其超出量由 NewData 的入参体量界定，属调用方自担。
+			r.peek = append(r.peek, buf[:n]...)
+			r.peekMu.Unlock()
+		}
+	}
+
+	if rerr != nil {
+		if isTimeoutErr(rerr) {
+			// 自身超时到期：这是等待型探测的正常结果，不是错误。
+			// 注意：可能是 stopMonitor 的"过去时间" deadline 把它催促出来的，
+			// 此时 fg 已释放，下一次 stopMonitor 会立即看到监控退出。
+			return false, nil
+		}
+		// 阻塞预读同样会收到 FIN：若预读缓冲里还有字节（含本次刚读到的），
+		// 语义与内核探测的 probeReadableHangup 一致，统一上报哨兵。
+		// 丢弃模式下数据已被主动丢弃，不构成「未读数据」，按原错误上报。
+		if !discard && errors.Is(rerr, io.EOF) {
+			r.peekMu.Lock()
+			hasUnread := len(r.peek) > 0
+			r.peekMu.Unlock()
+			if hasUnread {
+				return true, peerClosedWithUnreadError{}
+			}
+		}
+		return true, rerr
+	}
+	return false, nil
+}
+
+// tmpBuf 返回可复用的临时缓冲（避免每次预读都分配）。
+//
+// want > 0：预读模式，缓冲长度严格等于 want（多读会超出预读配额）；
+// want < 0：丢弃模式，-want 为单次最多丢弃的字节数，不足 minPeekBuf 时按 minPeekBuf。
+//
+// 收缩策略：丢弃模式可能一次就把缓冲撑到 maxPeekSize。该缓冲随连接常驻，
+// 若之后只需小额读取（如 CheckAliveBlocking 的 1 字节），继续保留大缓冲会让
+// 「曾用过大丢弃模式」的连接永久占用 1 MiB。这里在"当前需求不大且现有缓冲过大"时
+// 直接释放，交回 GC。
+func (r *connReader) tmpBuf(want int) []byte {
+	if want <= 0 {
+		// 丢弃模式取 |want|；want==0 仅作防御性兜底。预读模式不得走这里，
+		// 否则缓冲被放大到 minPeekBuf 就会越配额多读。
+		want = max(-want, minPeekBuf)
+	}
+	if want > maxPeekSize {
+		want = maxPeekSize
+	}
+	if cap(r.peekTmp) > peekTmpKeep && want <= peekTmpKeep {
+		r.peekTmp = nil // 释放历史大缓冲，避免 1 MiB/连接 常驻
+	}
+	if cap(r.peekTmp) < want {
+		r.peekTmp = make([]byte, want)
+	}
+	return r.peekTmp[:want]
+}
+
+// isTimeoutErr 判断是否为超时类错误（含 deadline 超出）
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return ne.Timeout()
+	}
+	return false
 }

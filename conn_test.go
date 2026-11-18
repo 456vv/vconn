@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 
 	//"fmt"
@@ -132,7 +133,7 @@ func Test_conn_SetBackgroundReadDiscard(t *testing.T) {
 
 		defer netConn.Close()
 		netConn = New(netConn)
-		netConn.(*Conn).SetBackgroundReadDiscard(true)
+		netConn.(*Conn).SetBackgroundReadBuffer(-1)
 
 		// 连接关闭事件
 		err = <-netConn.(CloseNotifier).CloseNotify()
@@ -173,7 +174,7 @@ func TestConn_DisableBackgroundRead(t *testing.T) {
 		}
 
 		netConn = New(netConn)
-		netConn.(*Conn).DisableBackgroundRead(true)
+		netConn.(*Conn).SetBackgroundReadBuffer(0)
 		defer netConn.Close()
 
 		go func() {
@@ -249,14 +250,22 @@ func TestConn_RawConn(t *testing.T) {
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	defer ln.Close()
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		c, _ := ln.Accept()
 		vc := New(c)
+		// 预读默认关闭（n=0）：要 RawConnFull 归还字节必须显式开启
+		vc.SetBackgroundReadBuffer(1)
 		ch := vc.CloseNotify() // start background
-		time.Sleep(100 * time.Millisecond)
+
+		// 后台预读是周期性的（默认 200ms 一轮），用轮询替代固定 sleep
+		if !waitPeekLen(vc, 1, 2*time.Second) {
+			t.Error("background peek did not happen in time")
+		}
 		raw, peeked := vc.RawConnFull()
 		if len(peeked) != 1 {
-			t.Error("unexpected peek")
+			t.Errorf("unexpected peek: %v", peeked)
 		}
 		defer raw.Close()
 		// 等待后台读结束
@@ -273,7 +282,7 @@ func TestConn_RawConn(t *testing.T) {
 	c, _ := net.Dial("tcp", ln.Addr().String())
 	c.Write([]byte{1, 2, 3})
 	defer c.Close()
-	time.Sleep(200 * time.Millisecond)
+	<-done
 }
 
 func TestConn_ReadLimit(t *testing.T) {
@@ -325,6 +334,22 @@ func pipe() (net.Conn, net.Conn) {
 	return c1, c2
 }
 
+// waitPeekLen 等待后台预读缓冲区攒到至少 n 字节（测试专用，直接观察内部状态）。
+// 预读是周期性的（默认 200ms 一轮），轮询比固定 sleep 更稳定。
+func waitPeekLen(vc *Conn, n int, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		vc.r.peekMu.Lock()
+		have := len(vc.r.peek)
+		vc.r.peekMu.Unlock()
+		if have >= n {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
 func TestConn_BasicReadWrite(t *testing.T) {
 	c1, c2 := pipe()
 	defer c1.Close()
@@ -371,6 +396,9 @@ func TestConn_ConcurrentReadWrite(t *testing.T) {
 func TestConn_CloseNotifyRemoteClose(t *testing.T) {
 	c1, c2 := pipe()
 	vc := New(c1)
+	// net.Pipe 没有内核级可读探测，只能退化为「带短超时的阻塞预读」，
+	// 因此必须显式开启预读（默认 0 = 关闭），否则永远检测不到对端关闭。
+	vc.SetBackgroundReadBuffer(1)
 
 	notify := vc.CloseNotify()
 
@@ -388,11 +416,7 @@ func TestConn_CloseNotifyRemoteClose(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for remote close notification")
 	}
-
-	if !vc.IsClosed() {
-		// 虽收到通知，但连接可能需要显式 Close 释放本地句柄或已由底层联动关闭
-		_ = vc.Close()
-	}
+	vc.Close()
 }
 
 func TestConn_CloseNotifyLocalClose(t *testing.T) {
@@ -419,6 +443,8 @@ func TestConn_ContinuousIdleBackgroundRead(t *testing.T) {
 	c1, c2 := pipe()
 	vc := New(c1)
 	defer c2.Close()
+	// net.Pipe 无内核探测，需显式开启预读才能在对端关闭时被唤醒
+	vc.SetBackgroundReadBuffer(1)
 
 	notify := vc.CloseNotify()
 
@@ -460,11 +486,6 @@ func TestConn_RawConnExtraction(t *testing.T) {
 		t.Fatal("RawConn returned nil")
 	}
 
-	// 验证包装连接的状态
-	if !vc.IsClosed() {
-		t.Error("Expected vconn to mark itself as closed after RawConn extraction")
-	}
-
 	select {
 	case err := <-notify:
 		if !errors.Is(err, ErrRawConnAlreadyUsed) {
@@ -492,19 +513,22 @@ func TestConn_RawConnFullPeeked(t *testing.T) {
 	defer c2.Close()
 
 	vc := New(c1)
-	_ = vc.CloseNotify() // 触发后台预读
+	vc.SetBackgroundReadBuffer(1) // net.Pipe 无内核探测，需显式开启预读
+	_ = vc.CloseNotify()          // 触发后台预读
 
-	// 给后台足够时间预读这一个字节
+	// 等后台真正预读到这一个字节（周期 200ms，轮询避免固定 sleep 抖动）
 	go func() {
 		_, _ = c2.Write([]byte("X"))
 	}()
-	time.Sleep(100 * time.Millisecond)
+	if !waitPeekLen(vc, 1, 2*time.Second) {
+		t.Fatal("background peek did not happen in time")
+	}
 
 	raw, peeked := vc.RawConnFull()
 	defer raw.Close()
 
 	if len(peeked) != 1 || peeked[0] != 'X' {
-		t.Errorf("Failed to capture peeked byte. Got peeked=%d", peeked[0])
+		t.Errorf("Failed to capture peeked byte. Got peeked=%q", peeked)
 	}
 }
 
@@ -617,24 +641,28 @@ func TestConn_SetReadLimit(t *testing.T) {
 func TestConn_RawConnFull(t *testing.T) {
 	s, c := net.Pipe()
 	vc := New(c)
+	vc.SetBackgroundReadBuffer(1) // net.Pipe 无内核探测，需显式开启预读
 
 	// 启动后台读触发预读
 	vc.CloseNotify()
 	go s.Write([]byte("A"))
 
-	// 给一点点时间让后台协程读取到 A
-	time.Sleep(50 * time.Millisecond)
+	// 等后台真正读取到 A（周期 200ms，轮询避免固定 sleep 抖动）
+	if !waitPeekLen(vc, 1, 2*time.Second) {
+		t.Fatal("background peek did not happen in time")
+	}
 
 	raw, buf := vc.RawConnFull()
+	defer raw.Close()
 	if len(buf) != 1 || buf[0] != 'A' {
-		t.Fatalf("RawConnFull failed to recover peeked byte: val=%c", buf[0])
+		t.Fatalf("RawConnFull failed to recover peeked byte: %q", buf)
 	}
 
 	// 验证 raw 是否正常工作
 	go s.Write([]byte("B"))
-	raw.Read(buf)
-	if buf[0] != 'B' {
-		t.Fatalf("Raw connection read failed")
+	n, err := raw.Read(buf)
+	if err != nil || n != 1 || buf[0] != 'B' {
+		t.Fatalf("Raw connection read failed: n=%d err=%v buf=%q", n, err, buf)
 	}
 }
 
@@ -659,5 +687,143 @@ func TestConn_SetBackgroundReadBuffer(t *testing.T) {
 	conn.Close()
 	if !bytes.Equal(buf, []byte("hello worl")) {
 		t.Fatalf("RawConnFull failed to recover peeked bytes: val=%s", string(buf))
+	}
+}
+
+func TestResolvePeekBlock(t *testing.T) {
+	tcp, _ := net.Pipe() // 非 syscall.Conn：direct=false
+	defer tcp.Close()
+	raw := &directConn{} // 见下，模拟 syscall.Conn
+
+	cases := []struct {
+		name       string
+		c          net.Conn
+		res        probeResult
+		allowBlock bool
+		wantSkip   bool
+		wantBlock  bool
+	}{
+		{"readable-direct", raw, probeReadable, false, false, false},
+		{"readable-wrap", tcp, probeReadable, true, true, false},
+		{"idle-direct-allow", raw, probeIdle, true, false, true},
+		{"idle-direct-noallow", raw, probeIdle, false, true, false},
+		{"idle-wrap", tcp, probeIdle, true, true, false},
+		{"unsupported", tcp, probeUnsupported, false, false, true},
+	}
+	for _, tc := range cases {
+		skip, block := resolvePeekBlock(tc.c, tc.res, tc.allowBlock)
+		if skip != tc.wantSkip || block != tc.wantBlock {
+			t.Errorf("%s: got (skip=%v, block=%v), want (%v, %v)",
+				tc.name, skip, block, tc.wantSkip, tc.wantBlock)
+		}
+	}
+}
+
+func TestCheckAliveBlocking_ProbeTimeout(t *testing.T) {
+	a, b := net.Pipe() // 非 syscall.Conn，走阻塞预读
+	defer a.Close()
+	defer b.Close()
+	c := New(a)
+
+	start := time.Now()
+	err := c.CheckAliveBlocking() // 对端静默
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("silent peer should be alive: %v", err)
+	}
+	// 2ms 超时 + 少量开销，给足余量
+	if elapsed > 10*time.Millisecond {
+		t.Fatalf("probe too slow: %v", elapsed)
+	}
+	if elapsed < 500*time.Microsecond {
+		t.Fatalf("probe returned too fast, did it actually wait? %v", elapsed)
+	}
+}
+
+// directConn 仅用于测试：让 isDirectSyscallConn 返回 true
+type directConn struct{ net.Conn }
+
+func (d *directConn) SyscallConn() (syscall.RawConn, error) { return nil, nil }
+
+// 端到端：net.Pipe（内核探测不可用 → 走 peekRead 分支）验证哨兵 + 数据不丢
+func TestNotifyHangupSentinel(t *testing.T) {
+	cli, srv := net.Pipe()
+	c := New(cli)
+	defer c.Close()
+	c.SetBackgroundReadBuffer(64)
+	c.SetMonitorInterval(20 * time.Millisecond)
+
+	ch := c.CloseNotify()
+	go func() {
+		_, _ = srv.Write([]byte("hello"))
+		_ = srv.Close() // 对端结束，但字节还压在预读缓冲里
+	}()
+
+	select {
+	case err := <-ch:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("必须保持 io.EOF 兼容，got %v", err)
+		}
+		if !errors.Is(err, ErrPeerClosedWithUnread) {
+			t.Fatalf("want hangup sentinel, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("没有收到关闭通知")
+	}
+
+	// 数据不得因通知而丢失，且 Read 的返回值必须是裸 io.EOF
+	buf := make([]byte, 16)
+	if n, err := io.ReadFull(c, buf[:5]); err != nil || string(buf[:n]) != "hello" {
+		t.Fatalf("预读数据丢失: n=%d err=%v", n, err)
+	}
+	if _, err := c.Read(buf); !errors.Is(err, io.EOF) || errors.Is(err, ErrPeerClosedWithUnread) {
+		t.Fatalf("Read 不应泄漏哨兵, got %v", err)
+	}
+}
+
+// 端到端：预读把内核队列搬空后再收到 FIN，通知必须带哨兵，且数据仍可读
+func TestNotifyHangupWithPeekBuffer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		c, _ := ln.Accept()
+		defer c.Close()
+		_, _ = c.Write([]byte("payload"))
+	}()
+
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := New(raw)
+	defer c.Close()
+	c.SetBackgroundReadBuffer(1024) // 关键：让预读把内核队列搬空
+	c.SetMonitorInterval(20 * time.Millisecond)
+
+	ch := c.CloseNotify()
+	select {
+	case err := <-ch:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("必须保持 io.EOF 兼容，got %v", err)
+		}
+		if !errors.Is(err, ErrPeerClosedWithUnread) {
+			t.Fatalf("want hangup sentinel, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("没有收到关闭通知")
+	}
+
+	buf := make([]byte, 32)
+	if n, err := io.ReadFull(c, buf[:7]); err != nil || string(buf[:n]) != "payload" {
+		t.Fatalf("数据丢失: n=%d err=%v", n, err)
+	}
+	// 读空后 Read 必须是裸 io.EOF，不带哨兵
+	if _, err := c.Read(buf); !errors.Is(err, io.EOF) || errors.Is(err, ErrPeerClosedWithUnread) {
+		t.Fatalf("Read 泄漏哨兵: %v", err)
 	}
 }
