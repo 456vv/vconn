@@ -1,6 +1,7 @@
 package vconn
 
 import (
+	"errors"
 	"io"
 	"net"
 )
@@ -37,28 +38,60 @@ const (
 
 // ==================== 挂断语义 ====================
 
-// peerClosedWithUnreadError 同时匹配 io.EOF 与 ErrPeerClosedWithUnread。
+// peerClosedWithUnreadError 表示「对端已结束，但还有未读数据」。
 //
-// 用自定义类型而非 fmt.Errorf("%w: %w", ...) 的原因：
-//   - 错误串稳定（便于日志检索与告警规则匹配），不暴露 io.EOF 的原文；
-//   - 值类型、零分配；
-//   - 可精确控制两个 Is 目标，不引入多余的中间节点。
-type peerClosedWithUnreadError struct{}
+// 它同时匹配 io.EOF 与 ErrPeerClosedWithUnread：
+//   - errors.Is(err, io.EOF) 成立 → 只判 EOF 的老代码行为完全不变；
+//   - errors.Is(err, ErrPeerClosedWithUnread) 成立 → 新代码可以区分
+//     「队列已读空的干净结束」与「还有数据没读完」。
+//
+// cause 保留真实终止原因：对端可能在发完一批数据后 RST（而不是优雅 FIN），
+// 此时若把原因抹成干净的 io.EOF，上层会把「异常中断」当成「正常收尾」，
+// 进而对非幂等请求做出错误的「已执行完」推断。
+type peerClosedWithUnreadError struct{ cause error }
 
-func (peerClosedWithUnreadError) Error() string {
-	return "vconn: peer closed with unread data (EOF)"
+func (e peerClosedWithUnreadError) Error() string {
+	if e.cause == nil {
+		return "vconn: peer closed with unread data (EOF)"
+	}
+	return "vconn: peer closed with unread data: " + e.cause.Error()
 }
 
-// Unwrap 让 errors.Is(err, io.EOF) 成立。
+// Unwrap 同时暴露 io.EOF 与真实原因（多错误解包，Go 1.20+）。
 //
-// 这一点对 terminalReadErr 至关重要：其首个分支是
-// `if cerr != nil && !errors.Is(cerr, io.EOF) { return cerr }`，
-// Unwrap 到 io.EOF 保证该分支不命中，Read 的返回语义保持不变。
-func (peerClosedWithUnreadError) Unwrap() error { return io.EOF }
+// 保留 io.EOF 对 terminalReadErr 至关重要：它依赖「哨兵满足 io.EOF」
+// 来避免把哨兵本身从 Read 返回；真实原因则由 Cause() 单独取用。
+func (e peerClosedWithUnreadError) Unwrap() []error {
+	if e.cause == nil {
+		return []error{io.EOF}
+	}
+	return []error{io.EOF, e.cause}
+}
 
-// Is 补充第二个判定目标（Unwrap 只能提供一个）。
-func (peerClosedWithUnreadError) Is(target error) bool {
+// Is 补充第二个判定目标（Unwrap 只能提供错误链，无法表达非错误的哨兵）。
+func (e peerClosedWithUnreadError) Is(target error) bool {
 	return target == ErrPeerClosedWithUnread
+}
+
+// Cause 返回真实终止原因（干净 FIN 时为 nil）。
+func (e peerClosedWithUnreadError) Cause() error { return e.cause }
+
+// Status 实现 Statuser：干净 FIN 归为 StatusPeerClosed，带真实原因时交给 StatusOf 判定
+// （通常落到 StatusPeerReset —— 异常中断，非幂等请求不可重试）。
+func (e peerClosedWithUnreadError) Status() Status {
+	if e.cause == nil {
+		return StatusPeerClosed
+	}
+	return StatusOf(e.cause)
+}
+
+// nonEOF 过滤掉 io.EOF 类的「非错误原因」，只保留真实错误。
+// 用于给哨兵挂 cause 时避免出现 Unwrap 到两次 io.EOF。
+func nonEOF(err error) error {
+	if err == nil || errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
 }
 
 // classifyPeek 把 MSG_PEEK 结果映射为探测结果。

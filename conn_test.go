@@ -15,9 +15,26 @@ import (
 
 type Fatal func(args ...interface{})
 
-// 测试客户端关闭，服务端收到io.EOF
+// assertPeerClosed 断言错误属于「对端正常结束」这一类。
+//
+// 用 StatusOf 而不是 err == io.EOF：对端「发完数据再关闭」时 vconn 会带
+// ErrPeerClosedWithUnread（同时满足 errors.Is(err, io.EOF)），
+// 直接比较会在监控轮次与前台读的时序竞争下随机失败。
+func assertPeerClosed(t *testing.T, stage string, err error) {
+	t.Helper()
+	if k := StatusOf(err); k != StatusPeerClosed {
+		t.Fatalf("%s: 期望对端正常结束，得到 %v (kind=%v)", stage, err, k)
+	}
+}
+
+// 测试客户端关闭，服务端收到 io.EOF
+//
+// 断言统一走 StatusOf，而不是 err == io.EOF（或 err != io.EOF）：
+// 对端「发完数据再关闭」时 vconn 会带 ErrPeerClosedWithUnread（同时满足
+// errors.Is(err, io.EOF)），直接比较会在「监控轮次」与「前台读」的时序竞争下
+// 随机失败——这正是引入 Status 分类要解决的问题。
 func Test_conn_Read_1(t *testing.T) {
-	exit := make(chan int, 1)
+	notify := make(chan error, 1)
 	// 监听端
 	netListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -25,27 +42,18 @@ func Test_conn_Read_1(t *testing.T) {
 	}
 	defer netListener.Close()
 
-	fatal := t.Fatal
 	go func() {
 		netConn, err := netListener.Accept()
 		if err != nil {
-			fatal(err)
+			notify <- err
+			return
 		}
 
-		netConn = New(netConn)
-		go func(nc CloseNotifier) {
-			// 连接关闭事件
-			err := <-nc.CloseNotify()
-			if err != io.EOF {
-				fatal(err)
-			}
-			exit <- 1
-		}(netConn.(CloseNotifier))
-
-		if _, err = io.Copy(io.Discard, netConn); err != nil {
-			fatal(err)
-		}
-		netConn.Close()
+		vc := New(netConn)
+		ch := vc.CloseNotify()
+		_, _ = io.Copy(io.Discard, vc)
+		notify <- <-ch
+		vc.Close()
 	}()
 
 	// 发送端
@@ -56,12 +64,14 @@ func Test_conn_Read_1(t *testing.T) {
 	}
 	netConn.Write([]byte("123456"))
 	netConn.Close()
-	<-exit
+
+	assertPeerClosed(t, "关闭通知", <-notify)
 }
 
-// 测试客户端关闭，服务端收到io.EOF
+// 测试客户端关闭，服务端收到 io.EOF
 func TestConn_Read_2(t *testing.T) {
-	exit := make(chan int, 1)
+	notify := make(chan error, 1)
+	readErr := make(chan error, 1)
 	// 监听端
 	netListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -69,37 +79,35 @@ func TestConn_Read_2(t *testing.T) {
 	}
 	defer netListener.Close()
 
-	fatal := t.Fatal
 	go func() {
 		netConn, err := netListener.Accept()
 		if err != nil {
-			fatal(err)
+			notify <- err
+			readErr <- err
+			return
 		}
 		defer netConn.Close()
 
-		netConn = New(netConn)
+		vc := New(netConn)
+		ch := vc.CloseNotify()
+
 		go func() {
 			p := make([]byte, 8)
 			for {
-				n, err := netConn.Read(p)
+				n, err := vc.Read(p)
 				if err != nil {
-					if err != io.EOF {
-						fatal(err)
-					}
-					break
-				} else if n == 0 {
-					fatal("unexpected zero read")
-					break
+					readErr <- err
+					return
+				}
+				if n == 0 {
+					readErr <- errors.New("unexpected zero read")
+					return
 				}
 			}
-			exit <- 1
 		}()
 
 		// 连接关闭事件
-		err = <-netConn.(CloseNotifier).CloseNotify()
-		if err != io.EOF {
-			fatal(err)
-		}
+		notify <- <-ch
 	}()
 
 	// 发送端
@@ -110,13 +118,15 @@ func TestConn_Read_2(t *testing.T) {
 	}
 	netConn.Write([]byte("1234567890"))
 	netConn.Close()
-	<-exit
+
+	assertPeerClosed(t, "关闭通知", <-notify)
+	assertPeerClosed(t, "前台 Read", <-readErr)
 }
 
-// 测试客户端关闭，服务端收到io.EOF
+// 测试客户端关闭，服务端收到 io.EOF
 // 后台读取丢弃
 func Test_conn_SetBackgroundReadDiscard(t *testing.T) {
-	exit := make(chan int, 1)
+	notify := make(chan error, 1)
 	// 监听端
 	netListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -124,23 +134,17 @@ func Test_conn_SetBackgroundReadDiscard(t *testing.T) {
 	}
 	defer netListener.Close()
 
-	fatal := t.Fatal
 	go func() {
 		netConn, err := netListener.Accept()
 		if err != nil {
-			fatal(err)
+			notify <- err
+			return
 		}
-
 		defer netConn.Close()
-		netConn = New(netConn)
-		netConn.(*Conn).SetBackgroundReadBuffer(-1)
 
-		// 连接关闭事件
-		err = <-netConn.(CloseNotifier).CloseNotify()
-		if err != io.EOF {
-			fatal(err)
-		}
-		exit <- 1
+		vc := New(netConn)
+		vc.SetBackgroundReadBuffer(-1)
+		notify <- <-vc.CloseNotify()
 	}()
 
 	// 发送端
@@ -151,13 +155,15 @@ func Test_conn_SetBackgroundReadDiscard(t *testing.T) {
 	}
 	netConn.Write([]byte("12345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"))
 	netConn.Close()
-	<-exit
+
+	assertPeerClosed(t, "丢弃模式关闭通知", <-notify)
 }
 
-// 测试客户端关闭，服务端收到io.EOF
+// 测试客户端关闭，服务端收到 io.EOF
 // 不允许后台读取
 func TestConn_DisableBackgroundRead(t *testing.T) {
-	exit := make(chan int, 1)
+	notify := make(chan error, 1)
+	dataErr := make(chan error, 1)
 	// 监听端
 	netListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -165,36 +171,32 @@ func TestConn_DisableBackgroundRead(t *testing.T) {
 	}
 	defer netListener.Close()
 
-	fatal := t.Fatal
 	p := []byte("12345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890")
 	go func() {
 		netConn, err := netListener.Accept()
 		if err != nil {
-			fatal(err)
+			notify <- err
+			dataErr <- err
+			return
 		}
-
-		netConn = New(netConn)
-		netConn.(*Conn).SetBackgroundReadBuffer(0)
 		defer netConn.Close()
 
-		go func() {
-			// 连接关闭事件
-			err := <-netConn.(CloseNotifier).CloseNotify()
-			if err != io.EOF {
-				fatal(err)
-			}
-			exit <- 1
-		}()
+		vc := New(netConn)
+		vc.SetBackgroundReadBuffer(0)
+		ch := vc.CloseNotify()
 
+		// 关闭通知与前台读并行：通知必须在读完之前就绪（本包的核心能力）
 		time.Sleep(time.Second)
 
 		buf := bytes.NewBuffer(nil)
-		if _, err := buf.ReadFrom(netConn); err != nil {
-			fatal(err)
+		if _, err := buf.ReadFrom(vc); err != nil {
+			dataErr <- err
+		} else if !bytes.Equal(buf.Bytes(), p) {
+			dataErr <- errors.New("read data mismatch: " + buf.String())
+		} else {
+			dataErr <- nil
 		}
-		if !bytes.Equal(buf.Bytes(), p) {
-			fatal("error")
-		}
+		notify <- <-ch
 	}()
 
 	// 发送端
@@ -205,7 +207,11 @@ func TestConn_DisableBackgroundRead(t *testing.T) {
 	}
 	netConn.Write(p)
 	netConn.Close()
-	<-exit
+
+	assertPeerClosed(t, "关闭通知", <-notify)
+	if err := <-dataErr; err != nil {
+		t.Fatalf("前台读数据失败: %v", err)
+	}
 }
 
 func TestConn_Basic(t *testing.T) {
@@ -232,9 +238,7 @@ func TestConn_Basic(t *testing.T) {
 
 		select {
 		case e := <-ch:
-			if e != io.EOF {
-				t.Errorf("expected EOF, got %v", e)
-			}
+			assertPeerClosed(t, "关闭通知", e)
 		case <-time.After(2 * time.Second):
 			t.Error("timeout")
 		}
@@ -633,8 +637,17 @@ func TestConn_SetReadLimit(t *testing.T) {
 	}
 
 	n, err := vc.Read(buf)
-	if err != io.EOF || n != 0 {
+	if !errors.Is(err, io.EOF) || n != 0 {
 		t.Fatalf("Expected EOF after limit, got %v", err)
+	}
+	// 配额耗尽必须与「对端关闭」区分开：否则池化代码会为一次配额用尽去重连。
+	if k := StatusOf(err); k != StatusQuota {
+		t.Fatalf("配额耗尽应归类为 StatusQuota，得到 %v (%v)", k, err)
+	}
+	select {
+	case e := <-vc.CloseNotify():
+		t.Fatalf("配额耗尽不应触发关闭通知，却收到 %v", e)
+	default:
 	}
 }
 
@@ -719,21 +732,23 @@ func TestResolvePeekBlock(t *testing.T) {
 	}
 }
 
-func TestCheckAliveBlocking_ProbeTimeout(t *testing.T) {
+func TestCheckBlocking_ProbeTimeout(t *testing.T) {
 	a, b := net.Pipe() // 非 syscall.Conn，走阻塞预读
 	defer a.Close()
 	defer b.Close()
 	c := New(a)
 
 	start := time.Now()
-	err := c.CheckAliveBlocking() // 对端静默
+	st, err := c.CheckBlocking() // 对端静默
 	elapsed := time.Since(start)
 
-	if err != nil {
-		t.Fatalf("silent peer should be alive: %v", err)
+	if err != nil || st.Class() != StatusAlive {
+		t.Fatalf("silent peer should be alive: (%v, %v)", st, err)
 	}
-	// 2ms 超时 + 少量开销，给足余量
-	if elapsed > 10*time.Millisecond {
+	// 这里断言的是「绝不无限等待」这一不变量，而不是精确的 2ms：
+	// Windows 的系统 timer 粒度约 15.6ms，且负载下调度延迟可达数十毫秒，
+	// 按 2ms 量级断言会在并行跑其它测试时随机失败（无超时的实现则会直接挂到测试超时）。
+	if elapsed > 250*time.Millisecond {
 		t.Fatalf("probe too slow: %v", elapsed)
 	}
 	if elapsed < 500*time.Microsecond {

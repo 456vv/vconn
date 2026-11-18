@@ -349,8 +349,9 @@ func TestSocketError_UnsupportedNotClosed(t *testing.T) {
 
 	vc := New(s1)
 	defer vc.Close()
-	if err := vc.CheckAlive(); err != nil {
-		t.Fatalf("健康连接 CheckAlive 应 fail-open 返回 nil，得到 %v", err)
+	st, err := vc.Check()
+	if err != nil || st.Class() != StatusUnverified {
+		t.Fatalf("net.Pipe 上 Check 应 fail-open 返回 StatusUnverified，得到 (%v, %v)", st, err)
 	}
 }
 
@@ -374,17 +375,18 @@ func TestRead_NonCommonErrorPreserved(t *testing.T) {
 	}
 }
 
-// ==================== CheckAliveBlocking 无副作用 ====================
+// ==================== CheckBlocking 无副作用 ====================
 
-// TestCheckAliveBlocking_NoSideEffectOnPeekSize 一次探活不应把后台预读永久打开。
-func TestCheckAliveBlocking_NoSideEffectOnPeekSize(t *testing.T) {
+// TestCheckBlocking_NoSideEffectOnPeekSize 一次探活不应把后台预读永久打开。
+func TestCheckBlocking_NoSideEffectOnPeekSize(t *testing.T) {
 	s1, s2 := net.Pipe()
 	defer s1.Close()
 	defer s2.Close()
 
 	vc := New(s1)
-	if err := vc.CheckAliveBlocking(); err != nil {
-		t.Fatalf("静默对端应视为存活，得到 %v", err)
+	st, err := vc.CheckBlocking()
+	if err != nil || st.Class() != StatusAlive {
+		t.Fatalf("静默对端应视为存活，得到 (%v, %v)", st, err)
 	}
 	if got := vc.peekSize.Load(); got != 0 {
 		t.Fatalf("探活不应改写 peekSize，得到 %d", got)

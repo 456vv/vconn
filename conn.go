@@ -12,17 +12,32 @@
 //
 // 所有公开方法均并发安全。
 //
+// 状态与错误分类（v3，详见 docs/v2-probe-api.md 与 state.go / kind.go）：
+//
+//   - Status 是唯一的「连接结论」类型，一个字节同时表达「类别」与「是否还有未读数据」。
+//     探测与错误共用同一套常量，调用方只需要学一个枚举：
+//     Check / CheckBlocking 返回 (Status, error)，CheckReusable 直接给出池化判定，
+//     Snapshot() 给出不探测的纯快照（永不会宣称「存活」），
+//     StatusOf(err) 把任意错误归到同一个 Status（Read / Write / CloseNotify / Check*
+//     的错误空间共用同一套答案，一个 switch 就够）。
+//   - 观测轴与处置轴共用类型但问题不同：Readable / Reusable / Ended 讲「连接怎么样」，
+//     Retryable / Terminal 讲「我该怎么做」。
+//
 // 内部不变量（实现约束，修改实现时必须保持）：
 //  1. 任何一次可能阻塞的后台 socket 读，都必须先置位 peekBusy 再写自身 deadline，
 //     二者同在 deadlineMu 内完成 —— stopMonitor 的「过去时间 deadline」不会被覆盖；
 //  2. 监控实例身份随调用链显式传递（peekStep(stop)），禁止用 c.mon 反查「我是否该退出」；
 //  3. 预读缓冲区的「有无数据」只由 peekMu 表达，不使用可能与切片不同步的原子标志；
-//  4. 探测结论（监控 / CheckAlive / CheckAliveBlocking）并入同一状态机，
+//  4. 探测结论（监控 / Check / CheckBlocking / CheckReusable）并入同一状态机，
 //     保证 Err() / IsPeerClosed() / CloseNotify() 三者一致；
 //     其中 probeReadableHangup 以 ErrPeerClosedWithUnread 落定 closeErr
 //     （该错误 Unwrap 到 io.EOF，且不得从 Read 返回）。
+//     探测只有一份实现（Conn.probe），其它方法都是它的视图；
 //  5. 探测阶段读走的 SO_ERROR 会保存到 closeErr，上层 Read 不会把 ECONNRESET 降级为 io.EOF；
-//  6. 已经从内核读出的字节只允许追加进预读缓冲区，任何情况下不得裁剪（裁剪即丢数据）。
+//     带 cause 的 ErrPeerClosedWithUnread 同理（见 terminalReadErr）；
+//  6. 已经从内核读出的字节只允许追加进预读缓冲区，任何情况下不得裁剪（裁剪即丢数据）；
+//  7. 「干净 FIN」的判定只有一处（isCleanPeerClose，建立在 StatusOf 之上）：
+//     探测升级、状态归类、通知内容都依赖它。
 package vconn
 
 import (
@@ -88,7 +103,7 @@ const (
 	// peekReadTimeout 监控协程（peekStep）阻塞预读的自身超时上限。
 	// 后台路径，宁可略长也不要空转：10ms 与实际探测周期匹配，开销可忽略。
 	peekReadTimeout = 10 * time.Millisecond
-	// peekTimeout CheckAliveBlocking（peekProbe）阻塞预读的自身超时。
+	// peekTimeout CheckBlocking（peekProbeStrict）阻塞预读的自身超时。
 	// 同步路径，调用方在等；但受系统 timer 精度限制，不建议低于 1ms（见下）。
 	peekTimeout = 2 * time.Millisecond
 	// monitorStopTimeout 等待监控协程退出的上限，绝不无限等待
@@ -104,9 +119,9 @@ const (
 	// 永久钉在每条连接上」。
 	peekTmpKeep = 64 << 10 // 64 KiB
 
-	// defaultPeekSize CheckAliveBlocking 单次阻塞探测的默认预读额度。
+	// defaultPeekSize CheckBlocking / CheckReusable 单次阻塞探测的默认预读额度。
 	// 取 minPeekBuf（4 KiB）：小到不会显著增加常驻内存，大到单次 syscall 不会被截断。
-	// 注意：这只是「本次探测的 peek 缓冲上限」，CheckAliveBlocking 单次只读 1 字节，
+	// 注意：这只是「本次探测的 peek 缓冲上限」，探测单次只读 1 字节，
 	// 且不会把该值写回连接（不产生"探活一次就永久开启后台预读"的副作用）。
 	defaultPeekSize = minPeekBuf
 )
@@ -175,7 +190,7 @@ type Conn struct {
 	// 写侧仍必须在 c.mu 内先更新 notified，再更新本镜像。
 	notified    atomic.Bool   // 是否已分发过关闭通知（可被 ResetNotify 撤销）
 	peekSize    atomic.Int64  // 后台预读/丢弃字节数：=0 关闭，>0 预读，<0 丢弃
-	peekUserSet atomic.Bool   // 是否被 SetBackgroundReadBuffer 显式设置过（决定 CheckAliveBlocking 能否隐式武装）
+	peekUserSet atomic.Bool   // 是否被 SetBackgroundReadBuffer 显式设置过（决定 CheckBlocking 能否隐式武装）
 	readSeq     atomic.Uint64 // 成功读取计数，用于判定连接是否空闲（比时间戳更廉价）
 	monInterval atomic.Int64  // 探测周期（纳秒）
 
@@ -333,7 +348,7 @@ func (c *Conn) finishLocalClose() {
 // 也不要再并发调用 NewData。
 // 对不支持 SetReadDeadline 的底层连接，本方法无法主动唤醒前台 Read。
 func (c *Conn) RawConnFull() (net.Conn, []byte) {
-	// 1. 先停监控：此后不会再有新的 peekStep/peekProbe 启动。
+	// 1. 先停监控：此后不会再有新的 peekStep/peekProbeStrict 启动。
 	c.stopMonitor()
 
 	// 2. 催促可能阻塞中的前台 Read 退出（预读也可能持有 fg，stopMonitor 已处理）。
@@ -349,7 +364,7 @@ func (c *Conn) RawConnFull() (net.Conn, []byte) {
 	c.deadlineMu.Unlock()
 
 	data := c.r.takePeek()
-	// 4. 仍持有 fg 时完成所有权转移：此后 Read/CheckAliveBlocking 不会再碰预读缓冲区。
+	// 4. 仍持有 fg 时完成所有权转移：此后 Read/CheckBlocking 不会再碰预读缓冲区。
 	raw := c.RawConn()
 	c.r.fg.Unlock()
 
@@ -373,7 +388,7 @@ func (c *Conn) RawConnFull() (net.Conn, []byte) {
 //
 // 为安全起见，|n| 超过 maxPeekSize 时按 maxPeekSize 截断。
 //
-// 调用本方法后，CheckAliveBlocking 不再隐式武装预读（完全尊重用户设置，
+// 调用本方法后，CheckBlocking / CheckReusable 不再隐式武装预读（完全尊重用户设置，
 // 包括显式设为 0 关闭）。
 func (c *Conn) SetBackgroundReadBuffer(n int) {
 	if n > maxPeekSize {
@@ -388,7 +403,10 @@ func (c *Conn) SetBackgroundReadBuffer(n int) {
 
 // SetReadLimit 设置读取限制字节数
 // remain < 0: 不限制
-// remain >= 0: 限制剩余可读字节数，超出后返回 io.EOF
+// remain >= 0: 限制剩余可读字节数，超出后返回 ErrQuotaExhausted
+// （它用 %w 包住 io.EOF，按 io.EOF 判定与比较的语义不变；
+// 想区分「配额用尽」与「对端关闭」请用 errors.Is(err, ErrQuotaExhausted)
+// 或 StatusOf(err) == StatusQuota）。配额耗尽不会触发关闭通知。
 func (c *Conn) SetReadLimit(remain int64) {
 	c.r.setReadLimit(remain)
 }
@@ -664,6 +682,8 @@ func (c *Conn) Err() error {
 //
 // 规则：
 //   - 对端已被判定断开（peerDown）且保存了非 EOF 的真实原因 → 返回该原因；
+//   - 哨兵带 cause（ErrPeerClosedWithUnread + ECONNRESET）→ 返回该 cause，
+//     保证 Read 不会把异常断开降级成干净的 io.EOF（不变量第 5 条）；
 //   - 对端正常关闭（peerDown + io.EOF）且底层报 net.ErrClosed → 统一返回 io.EOF，
 //     避免上层把"正常结束"误判为异常；
 //   - 其它情况返回 nil，表示保持底层错误原样（超时等控制流错误绝不改写）。
@@ -679,8 +699,19 @@ func (c *Conn) terminalReadErr(err error) error {
 	if !peerDown {
 		return nil
 	}
-	if cerr != nil && !errors.Is(cerr, io.EOF) {
-		return cerr
+	if cerr != nil {
+		// 哨兵携带 cause 时优先上抛真实原因：它的 Unwrap 里含 io.EOF，
+		// 下面那条「非 EOF 才上抛」的守卫对它不生效，若在这里放过，
+		// ECONNRESET 就会被 Read 静默降级为 io.EOF。
+		var causer interface{ Cause() error }
+		if errors.As(cerr, &causer) {
+			if cause := causer.Cause(); cause != nil {
+				return cause
+			}
+		}
+		if !errors.Is(cerr, io.EOF) {
+			return cerr
+		}
 	}
 	if errors.Is(err, net.ErrClosed) {
 		return io.EOF
@@ -718,7 +749,10 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 		return n, nil // 有数据时优先返回数据，错误留到下一次（io.Reader 惯例）
 	}
 	if err != nil {
-		if isCommonNetError(err) {
+		// 配额耗尽（ErrQuotaExhausted）用 %w 包住了 io.EOF，但它不是「对端关闭」：
+		// 那是调用方自己设的上限，不能借此落定 peerDown，否则 IsPeerClosed /
+		// Status / CloseNotify 会一起撒谎（池化代码会因此误判连接已死）。
+		if isCommonNetError(err) && !errors.Is(err, ErrQuotaExhausted) {
 			c.notifyRemote(err)
 		}
 	}
@@ -912,25 +946,6 @@ func (c *Conn) CloseRead() error {
 	return ErrUnsupported
 }
 
-// Stats 返回连接的可观测计数快照（用于线上排障，不影响连接状态）。
-type Stats struct {
-	ReadSeq       uint64 // 成功读取次数（前台 + 底层）
-	ProbeCount    uint64 // 内核级探测调用次数
-	PeekBytes     uint64 // 后台预读/探活从 socket 读出的字节数（含丢弃模式）
-	MonitorRounds uint64 // 监控探测轮次
-	Notified      bool   // 是否已分发关闭通知
-	PeerDown      bool   // 是否已探测到对端断开
-	Closed        bool   // 是否本地已关闭/提取
-}
-
-// isCleanPeerClose 判断探测给出的关闭原因是否为「干净的 FIN」。
-// 只有干净 FIN 才允许升级为 ErrPeerClosedWithUnread；
-// ECONNRESET/EPIPE 等真实错误必须原样保留，否则 terminalReadErr
-// 会把异常断开降级成 io.EOF（见包文档不变量第 5 条）。
-func isCleanPeerClose(err error) bool {
-	return err == nil || errors.Is(err, io.EOF)
-}
-
 // probePeekAware 在内核探测之上，把「内核队列已空、但 vconn 自己的预读缓冲
 // 里还有未交付字节」的 probeClosed 归一为 probeReadableHangup。
 //
@@ -947,7 +962,144 @@ func (c *Conn) probePeekAware() (probeResult, error) {
 
 // ==================== 健康检查 ====================
 
-// checkKernel 执行内核级健康检查，供 CheckAlive/CheckAliveBlocking 共用。
+// probe 是连接状态探测的唯一实现：
+// Check / CheckBlocking / CheckReusable
+// 全部由它派生，保证「同一结论只有一份映射逻辑」。
+//
+// block=true 时，若内核探测不可用（probeUnsupported：net.Pipe、未知 wrapper
+// 等拿不到 fd 的连接），退化为一次带 peekTimeout（2ms）超时的阻塞预读；
+// 额度由 peekProbeBudget 决定，只影响本次调用，不写回连接状态。
+//
+// 返回值：
+//   - Status：本次观测的结论（含 flagUnread 修饰）；
+//   - error：本次探测的原因。终结类结论（对端结束 / 本地关闭）非 nil，
+//     非终结类结论（存活 / 有数据 / 无法验证）为 nil。
+//
+// 与 Err() 的区别：Err() 是连接级首次落定的结论（可能来自更早的监控轮次或
+// CancelNotify），本方法的 error 是「这一次为什么」。终结类结论在返回前
+// 会经由 recordProbe 并入状态机，因此 Err() / IsPeerClosed() / CloseNotify()
+// 与本方法的结论保持一致。
+func (c *Conn) probe(block bool) (Status, error) {
+	if c.closed.Load() {
+		return StatusLocalClosed, net.ErrClosed
+	}
+
+	res, err := c.checkKernel()
+	switch res {
+	case probeClosed:
+		if c.closed.Load() {
+			return StatusLocalClosed, net.ErrClosed
+		}
+		if err == nil {
+			err = io.EOF
+		}
+		err = c.recordProbe(err)
+		return peerState(err, c.r.hasPeek()), err
+
+	case probeReadableHangup:
+		if c.closed.Load() {
+			return StatusLocalClosed, net.ErrClosed
+		}
+		if err == nil {
+			err = peerClosedWithUnreadError{}
+		}
+		err = c.recordProbe(err)
+		return peerState(err, true), err
+
+	case probeReadable:
+		// 存活且有数据：对「探活」是活，对「复用」是脏（由 CheckReusable 判定）。
+		return StatusDataPending, nil
+
+	case probeIdle:
+		if c.r.hasPeek() {
+			return StatusDataPending, nil
+		}
+		return StatusAlive, nil
+	}
+
+	// probeUnsupported：内核探测不可用（拿不到 fd / 非 socket）。
+	if !block {
+		return StatusUnverified, nil
+	}
+	if c.r.hasPeek() {
+		return StatusDataPending, nil
+	}
+	size := c.peekProbeBudget()
+	if size == 0 {
+		// 用户显式关闭了预读，或处于丢弃模式：不能吞数据 → 无法验证。
+		return StatusUnverified, nil
+	}
+
+	switch res, cerr := c.r.peekProbeStrict(size); res {
+	case probeClosed:
+		if c.closed.Load() {
+			return StatusLocalClosed, net.ErrClosed
+		}
+		if cerr == nil {
+			cerr = io.EOF
+		}
+		cerr = c.recordProbe(cerr)
+		return peerState(cerr, c.r.hasPeek()), cerr
+
+	case probeReadableHangup:
+		if c.closed.Load() {
+			return StatusLocalClosed, net.ErrClosed
+		}
+		if cerr == nil {
+			cerr = peerClosedWithUnreadError{}
+		}
+		cerr = c.recordProbe(cerr)
+		return peerState(cerr, true), cerr
+
+	case probeReadable:
+		return StatusDataPending, nil
+
+	case probeIdle:
+		if c.r.hasPeek() {
+			return StatusDataPending, nil
+		}
+		return StatusAlive, nil
+	}
+
+	// 阻塞探测也没能给出答案（连接不支持 deadline / 前台正在读 / 本地已关闭）。
+	if c.closed.Load() {
+		return StatusLocalClosed, net.ErrClosed
+	}
+	return StatusUnverified, nil
+}
+
+// Check 探测连接状态：非阻塞、零消耗（net.Pipe 等无 fd 连接除外）、不关闭连接。
+//
+// 返回值：
+//
+//	StatusAlive                存活且当前无数据（已确认）
+//	StatusDataPending          存活，但有未读数据
+//	StatusPeerClosed(±Unread)  对端已结束；带 Unread 时数据仍可读，先 drain 再收尾
+//	StatusPeerReset(±Unread)   对端异常中断（RST/EPIPE/网络故障）
+//	StatusLocalClosed          本地已 Close / RawConn 提取
+//	StatusUnverified           无法判定（内核探测不可用）—— **不是死亡**
+//
+// 副作用边界：不消耗数据、不丢数据、不关闭底层连接；终结类结论会并入状态机
+// 并分发关闭通知（与监控协程结论一致）。
+//
+// 与 CheckReusable 的区别：本方法回答「活着吗」，StatusDataPending 对探活是活；
+// 池化判定要的是「能不能交给下一个人」，请用 CheckReusable。
+func (c *Conn) Check() (Status, error) { return c.probe(false) }
+
+// CheckBlocking 同 Check，但在内核探测不可用时退化为一次带 2ms 超时的阻塞预读。
+//
+// 预读额度：用户从未调用 SetBackgroundReadBuffer 时使用 defaultPeekSize（4 KiB），
+// 只作用于本次调用，不写回连接状态（一次探活不会把后台预读永久打开）。
+//   - 设置正值：使用该值；
+//   - 设置 0：不探测，返回 StatusUnverified（fail-open）；
+//   - 设置负值（丢弃模式）：探活不得吞数据，同样返回 StatusUnverified。
+//
+// 单次只读 1 字节，可高频重复调用；预读到的字节进入预读缓冲，前台 Read 优先消费。
+// 最坏等待 2ms；若前台正持有读锁（正在读），直接返回 StatusUnverified
+// ——前台读本身就是连接活着的证据。
+func (c *Conn) CheckBlocking() (Status, error) { return c.probe(true) }
+
+// checkKernel 执行内核级健康检查，供 probe / CheckReusable 共用。
 //
 // 返回值：
 //   - (probeClosed, err):         已确认断开；err 为断开原因（干净 FIN 时为 io.EOF，异常时为具体错误）
@@ -961,8 +1113,7 @@ func (c *Conn) probePeekAware() (probeResult, error) {
 //
 // socketError 返回 ErrUnsupported 时直接返回 probeUnsupported：
 // socketError 与 probeConn 都通过 syscallConnOf 解包 fd，前者拿不到 fd 时
-// 后者必然也拿不到，不必再浪费一次 probeConn 调用（原 CheckAliveBlocking
-// 在这里会多调一次，属于可省的冗余）。
+// 后者必然也拿不到，不必再浪费一次 probeConn 调用。
 func (c *Conn) checkKernel() (probeResult, error) {
 	if c.closed.Load() {
 		return probeClosed, net.ErrClosed
@@ -990,82 +1141,7 @@ func (c *Conn) checkKernel() (probeResult, error) {
 	return res, perr
 }
 
-// CheckAlive 主动探测连接是否存活（非阻塞，不消耗任何数据）
-//
-// 依次检查：本地关闭状态 → 内核 socket 待处理错误（SO_ERROR）→ 对端 FIN 探测。
-// 返回 nil 表示连接仍然可用（内核探测不可用时 fail-open 返回 nil）。
-//
-// 状态一致性：探测结论会并入连接状态机 —— peerDown / closeErr / CloseNotify
-// 与返回值保持一致，不再出现「CheckAlive 报错但 IsPeerClosed() 为 false、
-// 订阅者也收不到通知」的情况。
-//
-// 对 probeReadableHangup（对端已 FIN 但仍有未读数据）的处理与监控协程完全一致：
-// 落定 peerDown 并分发通知，但仍按「存活」返回 nil（数据可读）。
-//
-// 副作用边界：本方法不消耗任何数据，也不会丢数据，且**不会**关闭底层连接
-// （关闭始终是调用方的责任）。需要纯查询语义请改用 Stats().PeerDown。
-func (c *Conn) CheckAlive() error {
-	res, err := c.checkKernel()
-	switch res {
-	case probeClosed:
-		return c.recordProbe(err)
-	case probeReadableHangup:
-		// 与 monitorPass 同结论：只通知，不关闭底层（数据还没读空）。
-		c.recordProbe(err)
-		return nil
-	}
-	return nil
-}
-
-// CheckAliveBlocking 在 CheckAlive 基础上，当内核探测不可用
-// （probeUnsupported：net.Pipe、未知 wrapper 等拿不到 fd 的连接）时，
-// 退化为一次带 peekProbeTimeout（2ms）超时的阻塞预读探测。
-//
-// 预读额度：若用户从未调用过 SetBackgroundReadBuffer，本次探测使用
-// defaultPeekSize（4 KiB）作为「本次」缓冲上限，**不会写回连接状态**，
-// 因此一次探活不会把后台预读永久打开（无副作用）。
-// 用户之后可用 SetBackgroundReadBuffer 扩大/缩小/关闭：
-//   - 设置正值：后续 CheckAliveBlocking 使用该值；
-//   - 设置 0：显式关闭预读，CheckAliveBlocking 退化为 fail-open 返回 nil；
-//   - 设置负值（丢弃模式）：视为「探活不得吞数据」，同样 fail-open 返回 nil。
-//
-// 单次探测只读 1 字节（见 peekProbe），因此可高频重复调用：
-//   - 前台 Read 正常消费 → peek 长期接近空；
-//   - 前台不消费 → peek 最多累积到额度上限，之后探测直接判活返回 nil，
-//     不报错、不阻塞、不再读（"有未读数据"本身就是连接活着的证据）。
-//
-// 数据安全：预读到的字节进入 peek 缓冲区，前台 Read 会优先消费，不会丢失。
-// 同步性：最坏等待 peekProbeTimeout（2ms）；若前台正持有 fg 锁（正在读），
-// 本次探测直接放弃并视为存活（返回 nil），因为前台读本身是连接活着的证据。
-//
-// 状态一致性、副作用边界：与 CheckAlive 完全相同。
-func (c *Conn) CheckAliveBlocking() error {
-	res, err := c.checkKernel()
-	switch res {
-	case probeClosed:
-		return c.recordProbe(err)
-	case probeReadableHangup:
-		c.recordProbe(err)
-		return nil
-	case probeUnsupported:
-		// 内核探测不可用：继续走阻塞预读兜底
-	default: // probeIdle / probeReadable
-		return nil
-	}
-
-	// 内核探测不可用：用本次探测的额度走阻塞预读（不修改连接状态）
-	size := c.peekProbeBudget()
-	if size == 0 {
-		return nil // 用户显式关闭了预读（或处于丢弃模式），fail-open
-	}
-	closed, cerr := c.r.peekProbe(probeUnsupported, true, size)
-	if closed {
-		return c.recordProbe(cerr)
-	}
-	return nil
-}
-
-// peekProbeBudget 返回 CheckAliveBlocking 本次探测可用的预读额度。
+// peekProbeBudget 返回 CheckBlocking / CheckReusable 本次探测可用的预读额度。
 //
 // 用户显式设置过（含显式 0）→ 完全尊重；否则仅在本次探测使用 defaultPeekSize，
 // 不写回 peekSize —— 避免「一次探活就永久开启后台预读」的隐式副作用。

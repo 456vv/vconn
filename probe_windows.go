@@ -133,7 +133,7 @@ func probeFDWin(h windows.Handle) (probeResult, error) {
 		}
 		if n > 0 {
 			if fatal {
-				return probeReadableHangup, peerClosedWithUnreadError{}
+				return winReadableHangup(h)
 			}
 			return probeReadable, nil
 		}
@@ -156,6 +156,18 @@ func probeFDWin(h windows.Handle) (probeResult, error) {
 	}
 	// 连续两轮「可读 + 0 字节」：按对端 FIN 处理。
 	return winClosedResult(h)
+}
+
+// winReadableHangup 生成 Windows 的「有数据 + 挂断」探测结果。
+//
+// 尽量保留 SO_ERROR 作为 cause（RST 等真实原因）：直接给零值哨兵会把
+// 异常中断抹成「干净的 FIN」，上层就无法区分「对端正常收尾」与「连接被重置」。
+// 拿不到 SO_ERROR 时按干净 FIN 处理（数据确实还在队列里，可以读）。
+func winReadableHangup(h windows.Handle) (probeResult, error) {
+	if serr, gerr := sockErrorOf(h); gerr == nil && serr != nil {
+		return probeReadableHangup, peerClosedWithUnreadError{cause: serr}
+	}
+	return probeReadableHangup, peerClosedWithUnreadError{}
 }
 
 // availableBytesWin 查询接收队列中可读字节数（不消费、不阻塞）
@@ -195,6 +207,12 @@ func sockErrorOf(h windows.Handle) (error, error) {
 
 // winClosedResult 生成 Windows 的「已关闭」探测结果：
 // 优先返回 SO_ERROR；拿不到 SO_ERROR 时按正常 FIN（io.EOF）处理。
+//
+// 已知局限：Winsock 只在 recv 时报告 TCP RST，SO_ERROR 通常为 0，
+// 因此「可读 + 0 字节」有可能把 RST 报成干净的 FIN。真实原因不会丢——
+// 前台 Read 仍会拿到 wsarecv 的 RST 错误，且 terminalReadErr 不会把它降级
+// （不变量第 5 条）。想在这里补一次 recv(MSG_PEEK) 取原因是不安全的：
+// 该 socket 在 Win32 层是阻塞模式，无数据时会永久阻塞监控协程。
 func winClosedResult(h windows.Handle) (probeResult, error) {
 	serr, gerr := sockErrorOf(h)
 	if gerr != nil {

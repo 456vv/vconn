@@ -574,29 +574,6 @@ func TestReadLimit_ConcurrentExact(t *testing.T) {
 	}
 }
 
-// ==================== B17 健康检查 ====================
-
-func TestCheckAlive(t *testing.T) {
-	vc, srv, ln := newTCPPair(t)
-	defer ln.Close()
-
-	if err := vc.CheckAlive(); err != nil {
-		t.Fatalf("健康连接 CheckAlive 应为 nil，得到 %v", err)
-	}
-
-	srv.Close()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := vc.CheckAlive(); err != nil {
-			vc.Close()
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	vc.Close()
-	t.Fatal("对端已关闭，CheckAlive 仍返回 nil")
-}
-
 // ==================== B21 NewData 种子语义 ====================
 
 func TestNewData_AppendsSeed(t *testing.T) {
@@ -776,7 +753,7 @@ func TestConcurrent_Stress(t *testing.T) {
 			default:
 			}
 			_, cancel := vc.WatchClose()
-			vc.CheckAlive()
+			vc.Check()
 			vc.Err()
 			vc.IsPeerClosed()
 			cancel()

@@ -9,6 +9,9 @@
 > `ResetNotify(force bool)`。原文中所有 `ResetNotify()` 读作 `ResetNotify(false)`，
 > 所有 `ResetNotify(ResetForce())` 读作 `ResetNotify(true)`；`ResetOption` / `resetConfig` /
 > `ResetForce` 三个标识符已删除，语义与安全边界不变。
+>
+> **勘误（2026-11-18）**：A4 的 `NotifyRound()` / `WatcherCount()` 在当前代码中**已不存在**
+> （随观测能力一起被精简）；本文其余 `ResetNotify(force bool)` 语义与现状一致。
 
 ---
 

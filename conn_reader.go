@@ -129,7 +129,10 @@ func (r *connReader) Read(p []byte) (n int, err error) {
 	// 1. 处理 Read Limit 限流控制
 	limit := r.readLimit.Load()
 	if limit == 0 {
-		return 0, io.EOF
+		// 用哨兵而不是裸 io.EOF：StatusOf 能把它与「对端关闭」区分开
+		// （StatusQuota vs StatusPeerClosed），否则池化代码会为一次配额用尽
+		// 去重连。哨兵用 %w 包住 io.EOF，按 io.EOF 判定的语义不变。
+		return 0, ErrQuotaExhausted
 	}
 	if limit > 0 && int64(len(p)) > limit {
 		p = p[:limit]
@@ -303,8 +306,20 @@ func (r *connReader) peekStep(stop <-chan struct{}, res probeResult, allowBlock 
 	return r.peekRead(stop, want, discard, peekTimeout)
 }
 
-// peekProbe 执行一次「最小化」后台预读：单次最多读取 1 字节，
-// 供 CheckAliveBlocking 这类高频探测场景使用，避免一次性填满预读缓冲。
+// pendingError 返回上一次读取遗留的错误（数据与错误分两次返回的那一个）。
+//
+// idle=false 表示前台正在读（或后台预读持锁），此时无法给出确定答案，
+// 调用方应视为「忙」而不是「不可复用」。
+func (r *connReader) pendingError() (err error, idle bool) {
+	if !r.fg.TryLock() {
+		return nil, false
+	}
+	defer r.fg.Unlock()
+	return r.pending, true
+}
+
+// peekProbeStrict 执行一次「最小化」阻塞预读探测（单次最多读 1 字节），
+// 供 CheckBlocking / CheckReusable 在内核探测不可用（拿不到 fd）时兜底。
 //
 // size 为本次探测可用的预读额度（由 Conn.peekProbeBudget 决定）：
 // 它只影响本次调用，不会写回连接状态。
@@ -312,16 +327,19 @@ func (r *connReader) peekStep(stop <-chan struct{}, res probeResult, allowBlock 
 // 与 peekStep 的差异：
 //   - 单次读长度固定为 1（peekStep 预读模式读 want = size-have）；
 //   - 预读模式下若 peek 缓冲已达 size 上限，视为「有未读数据 = 连接存活」，
-//     直接返回 false（不阻塞、不报错、不再读）——这是「多次调用不造成缓冲满误判」的关键；
+//     直接返回 probeReadable（不阻塞、不报错、不再读）；
 //   - 丢弃模式下按 1 字节丢弃，不按 minPeekBuf 放大（避免高频探测吞掉大段数据）；
 //     注意：丢弃模式已被 Conn.peekProbeBudget 挡在门外（返回 0 → 不调用本函数），
 //     这里的支持仅为防御性保留；
 //   - stop 传 nil：用户态探活不受监控换代影响，且自身超时保证可被唤醒。
 //
-// 返回 closed=true 表示探测到对端关闭；err 为原因。
-func (r *connReader) peekProbe(res probeResult, allowBlock bool, size int) (closed bool, err error) {
-	if size == 0 || r.conn.closed.Load() {
-		return false, nil
+// 与旧 peekProbe 的关键差异：无法探测（不支持 deadline / 前台在读 /
+// 已本地关闭）时返回 probeUnsupported，而不是伪装成「存活」。
+// CheckReusable 必须能区分「确认存活」与「未能验证」，否则会把状态未知的
+// 连接当作健康连接交给下一个使用者。
+func (r *connReader) peekProbeStrict(size int) (probeResult, error) {
+	if size == 0 || r.conn.closed.Load() || r.noDeadline.Load() {
+		return probeUnsupported, nil
 	}
 	discard := size < 0
 
@@ -332,29 +350,46 @@ func (r *connReader) peekProbe(res probeResult, allowBlock bool, size int) (clos
 		have := len(r.peek)
 		r.peekMu.Unlock()
 		if have >= size {
-			return false, nil
+			return probeReadable, nil
 		}
 	}
 
-	skip, _ := resolvePeekBlock(r.conn.rwc, res, allowBlock)
-	if skip {
-		// 表示不用预读
-		return false, nil
+	if skip, _ := resolvePeekBlock(r.conn.rwc, probeUnsupported, true); skip {
+		return probeUnsupported, nil
 	}
-
-	// 前台正在读，让路：前台读本身是连接活着的证据
 	if !r.fg.TryLock() {
-		return false, nil
+		// 前台正在读（或后台预读持锁）：让路，本次无法判定。
+		return probeUnsupported, nil
 	}
 	defer r.fg.Unlock()
 
-	done, derr := r.peekRead(nil, 1, discard, peekTimeout)
-	if done && r.conn.closed.Load() {
-		// 本地已关闭（并发 Close/RawConn）：这不是"对端结论"，
-		// 交给下一次 checkKernel 以 net.ErrClosed 如实上报。
-		return false, nil
+	closed, rerr := r.peekRead(nil, 1, discard, peekTimeout)
+
+	if r.conn.closed.Load() || r.noDeadline.Load() {
+		// 本地已关闭 / 底层不支持 deadline：交给 checkKernel 以 net.ErrClosed
+		// 或 StatusUnverified 如实上报，不能在这里下「对端结论」。
+		return probeUnsupported, nil
 	}
-	return done, derr
+
+	unread := r.hasPeek()
+	if closed {
+		if rerr == nil {
+			rerr = io.EOF
+		}
+		if !discard && unread {
+			// 与内核探测的 probeReadableHangup 语义对齐：数据仍可读。
+			var sentinel peerClosedWithUnreadError
+			if !errors.As(rerr, &sentinel) {
+				rerr = peerClosedWithUnreadError{cause: nonEOF(rerr)}
+			}
+			return probeReadableHangup, rerr
+		}
+		return probeClosed, rerr
+	}
+	if !discard && unread {
+		return probeReadable, nil
+	}
+	return probeIdle, nil
 }
 
 // peekRead 读取一批数据放入预读缓冲区（discard=true 时丢弃）。
@@ -466,7 +501,7 @@ func (r *connReader) peekRead(stop <-chan struct{}, want int, discard bool, time
 // want < 0：丢弃模式，-want 为单次最多丢弃的字节数，不足 minPeekBuf 时按 minPeekBuf。
 //
 // 收缩策略：丢弃模式可能一次就把缓冲撑到 maxPeekSize。该缓冲随连接常驻，
-// 若之后只需小额读取（如 CheckAliveBlocking 的 1 字节），继续保留大缓冲会让
+// 若之后只需小额读取（如无 fd 连接探活的 1 字节），继续保留大缓冲会让
 // 「曾用过大丢弃模式」的连接永久占用 1 MiB。这里在"当前需求不大且现有缓冲过大"时
 // 直接释放，交回 GC。
 func (r *connReader) tmpBuf(want int) []byte {

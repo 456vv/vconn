@@ -33,8 +33,9 @@ func TestSyscallConnOf_UncomparableConn(t *testing.T) {
 
 	vc := New(c)
 	defer vc.Close()
-	if err := vc.CheckAlive(); err != nil {
-		t.Fatalf("CheckAlive 应 fail-open 返回 nil，得到 %v", err)
+	st, err := vc.Check()
+	if err != nil || st.Class() != StatusUnverified {
+		t.Fatalf("Check 应 fail-open 返回 StatusUnverified，得到 (%v, %v)", st, err)
 	}
 }
 

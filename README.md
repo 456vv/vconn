@@ -79,22 +79,28 @@ func (T *Conn) ResetNotify(force bool) error             // 清除已落定状�
 func (T *Conn) WithContext(ctx context.Context)          // 上下文取消时「通知」
 func (T *Conn) WithContextClose(ctx context.Context)     // 上下文取消时「关闭连接」
 
-// 状态
+// 状态与错误分类（同一个类型、同一套常量）
 func (T *Conn) IsPeerClosed() bool                       // 是否探测到对端已关闭
-func (T *Conn) Err() error                               // 关闭原因
-func (T *Conn) Stats() Stats                             // 可观测计数快照
-func (T *Conn) CheckAlive() error                        // 主动探活（非阻塞、不消耗数据）
-func (T *Conn) CheckAliveBlocking() error             // 主动探活（内核探测失败时退化为阻塞预读）
+func (T *Conn) Err() error                               // 关闭原因（连接级首次落定的结论）
+func (T *Conn) Check() (Status, error)                   // 主动探测：结论 + 本次原因（非阻塞、不消耗数据）
+func (T *Conn) CheckBlocking() (Status, error)           // 主动探测（内核探测不可用时退化为阻塞预读）
+func (T *Conn) CheckReusable() (Status, error)           // 连接池判定：仅 StatusAlive 可复用
+func (T *Conn) Snapshot() Status                         // 不探测的纯快照（永不返回 StatusAlive）
+func StatusOf(err error) Status                          // 错误 → 同一个 Status（唯一入口，适用于 Read/CloseNotify/Check*）
 
 // 配置
 func (T *Conn) SetBackgroundReadBuffer(n int)            // 预读字节数：>0 预读、0 关闭、<0 丢弃
-func (T *Conn) SetReadLimit(remain int64)                // 限制读取字节数，超出返回 io.EOF
+func (T *Conn) SetReadLimit(remain int64)                // 限制读取字节数，超出返回 ErrQuotaExhausted（匹配 io.EOF）
 func (T *Conn) SetMonitorInterval(d time.Duration)       // 空闲探测周期，默认 200ms
 
 // 原始连接提取（各只能调用一次，重复调用 panic）
 func (T *Conn) RawConn() net.Conn                        // 归还底层连接
 func (T *Conn) RawConnFull() (net.Conn, []byte)          // 归还底层连接 + 未消费的预读字节
 ```
+
+> **注**：`Stats` 结构体已在包内定义，但**没有**`Stats()` 方法，相关计数器也尚未接线；
+> 那部分可观测能力未落地，请勿依赖。需要了解当前状态用 `Snapshot()` / `Err()`，
+> 需要探测结论用 `Check()`。
 
 ## 参数速查
 
@@ -105,14 +111,115 @@ func (T *Conn) RawConnFull() (net.Conn, []byte)          // 归还底层连接 +
 | | `n = 0` | 关闭预读，仅保留内核级关闭探测 |
 | | `n < 0` | 丢弃模式：读到的数据直接丢弃，**会丢数据**；单次读取长度为 `max(\|n\|, 4 KiB)`（上限 1 MiB，且该缓冲随连接常驻） |
 | `SetReadLimit` | `-1` | 不限制 |
-| | `>= 0` | 剩余可读字节数，为 0 时 `Read` 返回 `io.EOF` |
+| | `>= 0` | 剩余可读字节数，为 0 时 `Read` 返回 `ErrQuotaExhausted`（`%w` 包住 `io.EOF`，`errors.Is(err, io.EOF)` 仍成立；不会触发关闭通知） |
 | `SetMonitorInterval` | `<= 0` | 恢复默认 200ms |
 | | `10ms ~` | 空闲连接的探测周期（灵敏度 / CPU 折中） |
-| `Stats` | — | 返回 `ReadSeq/ProbeCount/PeekBytes/MonitorRounds/Notified/PeerDown/Closed` 快照 |
 
-## CheckAliveBlocking 与安全阻塞探测
+## 状态与错误分类（v3：一个类型，两个轴）
 
-`CheckAliveBlocking` 是 `CheckAlive` 的增强版：内核探测（`SO_ERROR` + `poll`/`WSAPoll`）不可用时，**额外**尝试一次带短超时的阻塞预读探测。
+一次探测只有一份实现（`Conn.probe`），对外暴露成几个视图；错误只有一个分类入口（`StatusOf`）。
+两者给出的是**同一个类型** `Status`。
+
+> v2 曾把它拆成两个枚举：`State`（探测结论）与 `Kind`（错误分类）。它们是同一张表的两个投影
+> （9 个类别一一对应），却被分别维护 —— 同一个延迟错误会被一边答成「异常中断」、另一边答成
+> 「未知」。v3 合并为一个 `Status`：类型、常量、`String()` 都只有一套。
+> 设计说明与迁移对照见 [docs/v3-status-merge.md](docs/v3-status-merge.md)。
+
+### 观测轴：连接现在怎么样
+
+```go
+st, err := c.Check()                 // 非阻塞、零消耗探测
+switch st.Class() {
+case vconn.StatusAlive:               // 存活且当前无数据
+case vconn.StatusDataPending:         // 存活，但有未读数据（协议失步）
+case vconn.StatusPeerClosed:          // 对端已结束，数据已读空
+case vconn.StatusPeerClosedWithUnread:// 对端已结束，但还有数据：先 drain 再收尾
+case vconn.StatusPeerReset:           // 对端异常中断（RST/EPIPE/截断）
+case vconn.StatusLocalClosed:         // 本地已 Close / RawConn 提取
+case vconn.StatusUnverified:          // 无法判定 —— 不是死亡
+}
+```
+
+`Status` 用一个字节同时表达「类别」与「是否还有未读数据」，因此
+`StatusPeerClosedWithUnread == StatusPeerClosed | flagUnread`，用 `Class()` 做 `switch`
+不会被修饰位干扰。
+
+| 方法 | 回答的问题 | 特点 |
+|---|---|---|
+| `Check() (Status, error)` | 现在怎么样 | 非阻塞；无 fd 连接返回 `StatusUnverified` |
+| `CheckBlocking() (Status, error)` | 同上，但会读 1 字节 | 无 fd 连接退化为 2ms 阻塞预读；额度由 `SetBackgroundReadBuffer` 决定 |
+| `CheckReusable() (Status, error)` | 能不能交给下一个使用者 | 仅 `StatusAlive` 返回 `nil`；错误都匹配 `ErrNotReusable` |
+| `Snapshot() Status` | 已经知道了什么 | **不探测**，永不返回 `StatusAlive`（缓存无法证明「还活着」），因此过期也是安全的 |
+
+**选型口诀**：
+
+- `Check` 答「**活不活**」，`CheckReusable` 答「**能不能借给别人**」，`Snapshot` 答「**我已经知道什么**」。
+- 旧版 `CheckAlive()/CheckAliveBlocking()` 已移除（v2 起被 `Check()/CheckBlocking()` 取代）。
+  迁移对照：
+
+| 旧写法 | 新写法 |
+|---|---|
+| `if c.CheckAlive() != nil { 丢弃 }` | `if st, err := c.Check(); st.Ended() { ... }` |
+| `if c.CheckAliveBlocking() != nil { 丢弃 }` | `if st, err := c.CheckBlocking(); st.Ended() { ... }` |
+
+> 旧 API 把结果压平成 `error`，无法区分「有未读数据」「无法验证（fail-open）」与
+> 「确认存活」；新 API 的 `Status` 是有限闭集，语义完整。
+
+### 处置轴：我该怎么做
+
+```go
+switch vconn.StatusOf(err) {              // 同一个入口适用于 Read / Write / CloseNotify / Check*
+case vconn.StatusPeerClosed:              // 对端正常结束 → 先 drain；幂等请求可重试
+case vconn.StatusPeerReset:               // 异常中断 → 换连接；非幂等请求不要重试
+case vconn.StatusLocalClosed,             // 本地已关闭
+	vconn.StatusDataPending:              // 有残留数据 → 丢弃
+case vconn.StatusBusy,                    // 被占用 / 落定通知未重置 → 退避重试
+	vconn.StatusUnverified:
+case vconn.StatusQuota,                   // SetReadLimit 用尽
+	vconn.StatusLatched:
+case vconn.StatusTimeout:                 // 自己的 deadline（连接未必坏）
+case vconn.StatusMisuse,                  // 用法错误 → 修代码
+	vconn.StatusUnsupported:
+}
+```
+
+### 两个轴共用同一个类型
+
+| 谓词 | 轴 | 回答的问题 |
+|---|---|---|
+| `Readable()` | 观测 | 现在还能读出数据吗（`StatusPeerClosedWithUnread` 也返回 `true`） |
+| `Reusable()` | 观测 | 能交给下一个使用者吗 |
+| `Ended()` | 观测 | 对端 / 本地已经结束了吗 |
+| `Unread()` | 观测 | 是否还有未读数据 |
+| `Retryable()` | 处置 | 换连接 / 稍后重试有意义吗 |
+| `Terminal()` | 处置 | 这条连接还能用吗 |
+
+三条关系（都有测试盯着）：
+
+- `Reusable()` ⟺ `StatusAlive`，且 `Reusable() ⇒ Readable()`；
+- `Ended() ⊂ Terminal()`：`StatusDataPending` / `StatusQuota` 是「终结但未结束」——
+  连接可能还活着，但不能再交给下一个人；
+- `StatusTimeout / StatusMisuse / StatusUnsupported / StatusUnknown` 只出现在错误空间，
+  `Check*` / `Snapshot` 永不返回它们。
+
+十余个哨兵 + 标准库错误 + 各平台 errno 在这里收敛成上面这套类别。需要精确细节时继续用
+`errors.Is`；自定义错误实现 `Statuser`（`Status() Status`）即可接入同一套分类。
+
+连接池用法：
+
+```go
+st, err := c.CheckReusable()
+if err != nil {
+    metrics.Drop(st.String(), vconn.StatusOf(err).String(), err) // 两轴都是 Status：同一种 label
+    _ = c.Close()
+    return 换一条连接重试
+}
+// st == vconn.StatusAlive：可以放心交给下一个使用者
+```
+
+## CheckBlocking 与安全阻塞探测
+
+`CheckBlocking` 在内核探测（`SO_ERROR` + `poll`/`WSAPoll`）不可用时，**额外**尝试一次带短超时的阻塞预读探测。
 
 它走两条路径：
 
@@ -121,7 +228,7 @@ func (T *Conn) RawConnFull() (net.Conn, []byte)          // 归还底层连接 +
 | 内核探测 | 连接能解包到 `syscall.Conn`（`*net.TCPConn`、`*tls.Conn` 等） | 零字节消耗，直接返回结果 | ✅ 不碰数据 |
 | 阻塞预读 | 拿不到 fd（`net.Pipe`、未知 wrapper 等） | 读 **1 字节**（带 2ms 超时），放入 peek 缓冲 | ✅ 前台 `Read` 优先消费 |
 
-**探活不产生副作用**：`CheckAliveBlocking` 只对**本次调用**使用 4 KiB 的预读额度，
+**探活不产生副作用**：`CheckBlocking` 只对**本次调用**使用 4 KiB 的预读额度，
 不会把 `peekSize` 写回连接，因此「探活一次」不会悄悄打开后台预读。
 （旧实现会 `CAS(0 → 4096)`，导致一次探活就永久开启后台读。）
 
@@ -158,8 +265,9 @@ c := vconn.New(tlsConn)
 defer c.Close()
 
 // 走内核探测：WSAPoll / poll(2)，零字节消耗
-if err := c.CheckAliveBlocking(); err != nil {
-    log.Printf("connection dead: %v", err)
+st, err := c.CheckBlocking()
+if st.Ended() {
+    log.Printf("connection dead: %v (%v)", st, err)
     return
 }
 ```
@@ -167,11 +275,11 @@ if err := c.CheckAliveBlocking(); err != nil {
 数据安全要点：
 
 - 探测对象是**底层 TCP socket**，看到的是密文可读与否，**不会触发 TLS 握手**；
-- `CheckAliveBlocking` 在 `probeConn` 返回 `probeIdle`/`probeReadable` 时直接返回 `nil`，**不会进入 `peekProbe`**，不读任何字节。
+- `CheckBlocking` 在 `probeConn` 返回 `probeIdle`/`probeReadable` 时直接报告存活（`StatusAlive`），**不会进入 `peekProbe`**，不读任何字节。
 
 ### 示例 2：TLS 外包了 wrapper（安全降级，不报错）
 
-如果 wrapper 忘了实现 `NetConn()`，`CheckAliveBlocking` 会走 `probeUnsupported` 分支；由于连接不是 `syscall.Conn`、也不是 `SafeBlockProber`，**默认跳过阻塞预读**，返回 `nil`（fail-open）：
+如果 wrapper 忘了实现 `NetConn()`，`CheckBlocking` 会走 `probeUnsupported` 分支；由于连接不是 `syscall.Conn`、也不是 `SafeBlockProber`，**默认跳过阻塞预读**，返回 `StatusUnverified`（fail-open，不是死亡）：
 
 ```go
 type myWrapper struct {
@@ -183,10 +291,11 @@ w := &myWrapper{conn: tlsConn}
 c := vconn.New(w)
 
 // 安全：不会读 TLS 层，不会触发握手，不会丢数据
-// 返回 nil 表示「无法探测，视为存活」
-if err := c.CheckAliveBlocking(); err != nil {
-    // 只有内核探测（若 wrapper 恰好能解包）才会返回错误
-    log.Printf("dead: %v", err)
+// StatusUnverified 表示「无法探测」，不是死亡
+st, err := c.CheckBlocking()
+if st.Class() == vconn.StatusUnverified {
+    // 只有内核探测（若 wrapper 恰好能解包）才会给出确定结论
+    log.Printf("unverified: %v", err)
 }
 ```
 
@@ -210,8 +319,9 @@ c := vconn.New(a)
 defer c.Close()
 
 // 直接可用：读 1 字节（带 2ms 超时），数据进 peek 缓冲
-if err := c.CheckAliveBlocking(); err != nil {
-    log.Printf("peer down: %v", err)
+st, err := c.CheckBlocking()
+if st.Ended() {
+    log.Printf("peer down: %v (%v)", st, err)
 }
 ```
 
@@ -240,8 +350,9 @@ func (m *memConn) SafeToBlockProbe() bool { return true } // 显式承诺可安�
 c := vconn.New(&memConn{})
 defer c.Close()
 
-if err := c.CheckAliveBlocking(); err != nil {
-    log.Printf("peer down: %v", err)
+st, err := c.CheckBlocking()
+if st.Ended() {
+    log.Printf("peer down: %v (%v)", st, err)
 }
 ```
 
@@ -259,11 +370,11 @@ if err := c.CheckAliveBlocking(); err != nil {
 对这些连接，正确做法是：
 
 - 能解包 fd → **什么也不用做**，自动走内核探测（`*tls.Conn` 就是这种情况）；
-- 拿不到 fd → 接受 fail-open（返回 `nil`），用其它手段（业务心跳、自己读到的 EOF）保证连接健康。
+- 拿不到 fd → 接受 fail-open（返回 `StatusUnverified`），用其它手段（业务心跳、自己读到的 EOF）保证连接健康。
 
 ### 行为速查
 
-| 连接 | `direct` | `SafeBlockProber` | `CheckAliveBlocking` 行为 |
+| 连接 | `direct` | `SafeBlockProber` | `CheckBlocking` 行为 |
 |---|---|---|---|
 | `*net.TCPConn` | ✅ | — | 内核探测 |
 | `*tls.Conn`（直接包装） | —（自动解包到 TCP） | — | 内核探测 |
@@ -272,7 +383,7 @@ if err := c.CheckAliveBlocking(); err != nil {
 | `net.Pipe`（裸） | ❌ | ❌ | 阻塞探测（叶子连接，默认允许） |
 | `net.Pipe` + `WrapSafeBlockProbe` | ❌ | ✅ | 阻塞探测 |
 | 自定义内存连接 + `SafeToBlockProbe` | ❌ | ✅ | 阻塞探测 |
-| 任何连接 + `SafeToBlockProbe() false` | — | opt-out | 跳过，返回 `nil` |
+| 任何连接 + `SafeToBlockProbe() false` | — | opt-out | 跳过，返回 `StatusUnverified` |
 | 自定义 `syscall.Conn` | ✅ | — | 阻塞探测（`SyscallConn` 失败时） |
 
 ⚠️ **TLS wrapper（无 `NetConn`）这一行是唯一的风险点**：因为它既拿不到 fd、
@@ -283,7 +394,7 @@ if err := c.CheckAliveBlocking(); err != nil {
 
 | 常量 | 默认值 | 用于 |
 |---|---|---|
-| `peekProbeTimeout` | 2ms | `CheckAliveBlocking` 同步阻塞探测 |
+| `peekProbeTimeout` | 2ms | `CheckBlocking` 同步阻塞探测 |
 | `peekReadTimeout` | 10ms | 监控协程后台预读 |
 
 受系统 timer 精度限制，低于 1ms 无意义；同步路径建议 1~5ms。
@@ -359,6 +470,21 @@ ch = vc.CloseNotify()           // 第 2 轮：新一轮监控协程，旧 chann
 | 预读/探测对 `ReadDeadline` 的影响 | 会抹掉调用方设置的超时 | 完全不修改，仅短暂使用自身超时并恢复 |
 | `SetReadBuffer/SetWriteBuffer` | 非 TCP 静默返回 `nil` | 不支持时返回 `ErrUnsupported` |
 
+### （2026-11-18）探测 API 收敛与错误分类
+
+设计说明见 [docs/v2-probe-api.md](docs/v2-probe-api.md)。
+
+| 场景 | 旧行为 | 新行为 |
+|---|---|---|
+| 探测结论的表达 | 只有 `error`（`nil` 同时表示「干净存活」「有数据可读」「无法验证」） | `Check/CheckBlocking` 返回 `(Status, error)`；`Status` 是有限闭集，可用 `switch` 穷举 |
+| 错误怎么区分 | 调用方对十余个哨兵逐个 `errors.Is` | `StatusOf(err)` 一个 switch：`StatusPeerClosed/PeerReset/DataPending/Busy/Quota/...`（`errors.Is` 仍可用于精确细节） |
+| 探测实现的份数 | `CheckAlive`/`CheckAliveBlocking` 各写一份 `checkKernel` 分支 | 只有 `Conn.probe` 一份实现，其它方法都是它的视图 |
+| 无 fd 连接的探测 | 旧 `CheckAliveBlocking` 把「无法探测」伪装成存活（`nil`） | `StatusUnverified` 如实上报 |
+| `SetReadLimit` 用尽 | `Read` 返回 `io.EOF`，与「对端关闭」无法区分，且**会落定 `peerDown`** | 返回 `ErrQuotaExhausted`（匹配 `io.EOF`），归类 `StatusQuota`，**不再触发关闭通知** |
+| `peerClosedWithUnreadError` 的原因 | 一律「干净 FIN 文案」，RST 被抹平 | 带 `cause` 保留真实原因；`terminalReadErr` 优先上抛 cause，Read 不再把 RST 降级为干净 EOF |
+| `syscall.ECONNRESET`（Windows） | 归一化常量（`APPLICATION_ERROR\|23`）不被识别 → `StatusUnknown` | Winsock 原始码与归一化常量都识别，同一原因得到同一分类 |
+| `CheckReusable` | 无（连接池只能自己拼 `CheckAlive` + 猜） | 新增：仅 `StatusAlive` 可复用，失败原因都匹配 `ErrNotReusable` |
+
 分层加固之后的额外修正，详见 [docs/impl-report-2026-11-16-plan-b.md](docs/impl-report-2026-11-16-plan-b.md)：
 
 | 场景 | 旧行为 | 新行为 |
@@ -373,7 +499,7 @@ ch = vc.CloseNotify()           // 第 2 轮：新一轮监控协程，旧 chann
 | 解包不可比较的自定义 `net.Conn` | `map[net.Conn]` 作环检测 → panic | 去掉 map，仅保留跳数上限 |
 | 监控协程自行退出 | `c.mon` 仍指向死实例，无法再开新一轮 | defer 里 `CompareAndSwap(m, nil)` |
 | `stopMonitor` 未「催促」预读时 | 仍无条件重写 `ReadDeadline`（多余 syscall） | 仅在实际改过 deadline 时恢复 |
-| `CheckAliveBlocking` | 一次探活永久打开 4 KiB 后台预读 | 只对本次探测生效，`peekSize` 不变 |
+| `CheckBlocking` | 一次探活永久打开 4 KiB 后台预读 | 只对本次探测生效，`peekSize` 不变 |
 | `socketError` 读不到选项 | 当成「已断开」，`CheckAlive` 误报 | 返回 `ErrUnsupported`，交由 `probeConn` 兜底 |
 | `Read` 返回 `(n>0, 非网络错误)` | 错误被静默丢弃 | 除超时外一律留存到下一次 |
 | illumos | 无 `socketError`/`probeConn` 实现，**编译失败** | 已补齐构建标签 |
@@ -390,8 +516,25 @@ ch = vc.CloseNotify()           // 第 2 轮：新一轮监控协程，旧 chann
 | Solaris / illumos / AIX 非 socket fd | `ENOTSOCK/EOPNOTSUPP/EINVAL` 被判为 `probeClosed` | 返回 `probeUnsupported`（无法探测 ≠ 已断开） |
 | `SetMonitorInterval` 修改周期 | 需等上一轮 timer 到期才生效 | 通过 wake 通道立即重置 timer |
 | `WrapSafeBlockProbe(*net.TCPConn)` | 包装后丢失 `SyscallConn`，退化为阻塞预读 | 转发 `SyscallConn`，仍走内核探测 |
-| 可观测性 | 无 | 新增 `Stats()`（读计数 / 探测次数 / 预读字节 / 监控轮次 / 状态） |
+| 可观测性 | 无 | 当时计划新增 `Stats()`（读计数 / 探测次数 / 预读字节 / 监控轮次 / 状态）；**后续未落地**：`Stats` 结构体已定义，但计数与 `Stats()` 方法尚未接线 |
 | 透传 API | 无 | 新增 `SetKeepAlive/SetKeepAlivePeriod/SetLinger/CloseWrite/CloseRead` |
+
+### （v3）`State` / `Kind` 合并为 `Status`
+
+设计说明见 [docs/v3-status-merge.md](docs/v3-status-merge.md)。**不保留旧名**（无兼容层）。
+
+| 项 | v2 | v3 |
+|---|---|---|
+| 类型 | `State` + `Kind` 两个枚举 | 一个 `Status`（类别占低 4 位 + `Unread` 修饰位） |
+| 常量 | `StateXxx` 与 `KindXxx` 两套 | `StatusXxx` 一套 |
+| 探测 API | `Check() (State, error)`、`CheckReusable() (State, error)` | `Check() (Status, error)`、`CheckReusable() (Status, error)` |
+| 纯快照 | `State() State` | `Snapshot() Status`（避开 `Statuser.Status()` 撞名） |
+| 错误分类 | `KindOf(err) Kind` | `StatusOf(err) Status` |
+| 自定义分类接口 | `Kinder { Kind() Kind }` | `Statuser { Status() Status }` |
+| 「有未读数据」 | `KindDirty`（错误）与 `StateDataPending`（观测）两个名字 | `StatusDataPending`（同一个值） |
+| 「无错误」 | `KindNone`（`String()` 为 `none`） | `StatusAlive`（`String()` 为 `alive`） |
+| `io.ErrUnexpectedEOF` | `KindOf` 说 peer-closed、`State` 说 peer-reset（自相矛盾） | 统一为 `StatusPeerReset`（截断 = 异常中断，非幂等请求不重试） |
+| 分类实现的份数 | `peerState` 与 `KindOf` 各一份映射 | 只有 `StatusOf` 一份；`peerState` 只负责收窄到「对端结束」并叠加未读位 |
 
 ## 性能
 
@@ -430,6 +573,7 @@ go test -bench . ./...   # 性能
 | `conn_harden_test.go` | 加固回归：限流含预读、对端 FIN 只通知不关底层、并发 Close 一致、监控补回、`RawConnFull` 零丢失、监控自清、探活无副作用、阻塞探测判定 |
 | `conn_peek_test.go` | 预读/丢弃缓冲长度契约 |
 | `conn_plan2_test.go` | 关闭状态机（`RawConn` 后不再关底层、并发 Close 只关一次）、`RawConnFull` 解阻塞、探测结果分类、选项透传 |
+| `status_test.go` | v3 Status 总表：`StatusOf` 黄金表、谓词总表（观测轴 + 处置轴）、表元不变量、探测只返回观测空间、两轴不漂移（含唯一合法例外）、`Check/CheckBlocking/CheckReusable/Snapshot` 各场景、哨兵 cause 与不降级、并发探测 |
 | `probe_helper_test.go` | 包装链解包、不可比较连接不 panic |
 | `probe_poll_linux_test.go` | Linux `POLLRDHUP` 与 `POLLIN` 的区分（`probeReadableHangup`） |
 | `probe_unix_test.go` | Solaris/illumos/AIX 非 socket fd 返回 `probeUnsupported` |

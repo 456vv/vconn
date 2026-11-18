@@ -88,6 +88,14 @@ func probeFDPoll(fd int) (probeResult, error) {
 		return probeIdle, nil
 
 	case hasData == peekData:
+		if hangup {
+			// 有数据 + 挂断：既可能是「发完数据再 FIN」，也可能是 RST。
+			// 取一次 SO_ERROR 保留真实原因，否则上层会把 RST 当成优雅关闭，
+			// 对非幂等请求做出「请求已执行完」的错误推断。
+			if e := sockErrorFD(fd); e != nil {
+				return probeReadableHangup, peerClosedWithUnreadError{cause: e}
+			}
+		}
 		return classifyPeek(hasData, hangup)
 
 	default: // peekEOF

@@ -285,14 +285,15 @@ func TestReadSeq_CountedBeforeMonitor(t *testing.T) {
 	}
 }
 
-func TestCheckAlive_AfterClose(t *testing.T) {
+func TestCheck_AfterClose(t *testing.T) {
 	s1, s2 := net.Pipe()
 	defer s2.Close()
 
 	vc := New(s1)
 	vc.Close()
-	if err := vc.CheckAlive(); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("关闭后 CheckAlive 应返回 net.ErrClosed，得到 %v", err)
+	st, err := vc.Check()
+	if !errors.Is(err, net.ErrClosed) || st.Class() != StatusLocalClosed {
+		t.Fatalf("关闭后 Check 应返回 (StatusLocalClosed, net.ErrClosed)，得到 (%v, %v)", st, err)
 	}
 }
 

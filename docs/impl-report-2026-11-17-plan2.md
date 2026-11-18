@@ -3,6 +3,11 @@
 > 日期：2026-11-17
 > 范围：`conn.go` / `conn_monitor.go` / `conn_reader.go` / `probe*.go` / `sockopt_windows.go`
 > 目标：在保持既有导出 API 语义的前提下，修复关闭状态机竞态、探测误判与资源泄漏，并补齐常用透传/观测能力。
+>
+> **勘误（2026-11-18）**：本文第 2 节列出的 `SetDeferredCloseTimeout`（延迟自动关闭，含 B8 兜底 timer）
+> 与 `Stats()`（可观测计数）**未进入当前代码**：前者已随「延迟自动关闭」方案撤销，
+> 后者的结构体虽保留但计数器与方法均未接线。阅读时请以代码为准。
+> 当前探测/状态相关的公开能力见 [v2-probe-api.md](v2-probe-api.md)。
 
 ---
 
