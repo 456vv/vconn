@@ -40,8 +40,8 @@ import "errors"
 // 类型同一 ≠ 取值相同，注意两条不对称：
 //   - StatusOf(err) 可能答出 StatusTimeout（连接没坏，是调用方的控制流），
 //     而 Check* 永不返回 StatusTimeout；
-//   - Check* 可能返回 StatusDataPending（有数据，不是错误），而 StatusOf(ErrConnDirty)
-//     恰好也是同一个值——因为「脏」对两条轴本就是同一件事。
+//   - Check* 可能返回 StatusDataPending（有数据，不是错误），而 StatusOf(ErrDataPending)
+//     恰好也是同一个值——因为有残留数据对两条轴本就是同一件事。
 //
 // 零值即「无错误」：StatusOf(nil) == StatusAlive，其 String() 为 "alive"。
 //
@@ -88,8 +88,8 @@ const (
 	// StatusTimeout 调用方自己设置的 deadline 到期。连接未必坏。
 	StatusTimeout
 
-	// StatusMisuse 调用方式错误（重复 RawConn、越界 ResetNotify）。不重试，修代码。
-	StatusMisuse
+	// StatusInUse 调用方式错误（重复 RawConn、越界 ResetNotify）。不重试，修代码。
+	StatusInUse
 
 	// StatusUnsupported 平台或底层连接不支持该操作。
 	StatusUnsupported
@@ -142,6 +142,32 @@ func (s Status) Readable() bool {
 // Reusable 报告该状态是否可以交给下一个使用者（只有干净存活算）。
 func (s Status) Reusable() bool { return s == StatusAlive }
 
+// Is 报告 err 是否归于本类别（带 unread 修饰的变体同样命中）。
+//
+// 它等价于 StatusOf(err).Class() == s.Class()，是后者的可读性糖：
+//
+//	if vconn.StatusDataPending.Is(err) {
+//		return pool.Drop
+//	}
+//	if vconn.StatusBusy.Is(err) {
+//		backoff()
+//		continue
+//	}
+//
+// 两点注意：
+//   - 只比较类别，不比较 unread 修饰位。StatusOf 是「错误 → 类别」的纯函数，
+//     它自己不产生 flagUnread：本包内部的错误类型都不会置位它（只有用户自实现的
+//     Statuser 可能返回带修饰的 Status）。要区分「队列读空的干净结束」与
+//     「还有数据没读完」：
+//     观测侧看 Check / CheckBlocking / CheckReusable / Snapshot 返回的
+//     Status.Unread()（peerState 按当时的 hasPeek 叠加该位）；
+//     错误侧看手上的这个错误本身是否 errors.Is(err, ErrPeerClosedWithUnread)
+//     —— 它由 CloseNotify 给出，描述的是创建该错误时的状态，之后数据可能已被读走；
+//   - StatusOf(nil) == StatusAlive，因此 StatusAlive.Is(nil) 为 true。
+func (s Status) Is(err error) bool {
+	return StatusOf(err).Class() == s.Class()
+}
+
 // Ended 报告「这条连接的对端或本地已经结束」。
 //
 // 注意：Ended 为真不等于必须立刻 Close —— StatusPeerClosedWithUnread 仍应先 drain。
@@ -184,11 +210,11 @@ func (s Status) String() string {
 	case StatusLatched:
 		b = "latched"
 	case StatusQuota:
-		b = "quota-exhausted"
+		b = "quota"
 	case StatusTimeout:
 		b = "timeout"
-	case StatusMisuse:
-		b = "misuse"
+	case StatusInUse:
+		b = "in-use"
 	case StatusUnsupported:
 		b = "unsupported"
 	case StatusUnknown:

@@ -85,8 +85,8 @@ func TestConn_ReadLimit(t *testing.T) {
 			if k := StatusOf(err); k != StatusQuota {
 				t.Fatalf("配额耗尽应归类为 StatusQuota，得到 %v (%v)", k, err)
 			}
-			if !errors.Is(err, ErrQuotaExhausted) || !errors.Is(err, io.EOF) {
-				t.Fatalf("ErrQuotaExhausted 必须同时匹配 io.EOF，得到 %v", err)
+			if !errors.Is(err, ErrQuota) || !errors.Is(err, io.EOF) {
+				t.Fatalf("ErrQuota 必须同时匹配 io.EOF，得到 %v", err)
 			}
 			if vc.IsPeerClosed() {
 				t.Fatal("配额耗尽不得落定为对端断开")

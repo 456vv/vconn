@@ -322,15 +322,15 @@ func TestCheckReusable(t *testing.T) {
 		{"干净连接", nil, StatusAlive, nil},
 		{
 			"预读脏", func(_ *testing.T, vc *Conn, _ net.Conn) { vc.r.pushPeek([]byte("leftover")) },
-			StatusDataPending, ErrConnDirty,
+			StatusDataPending, ErrDataPending,
 		},
 		{
 			"通知已落定", func(_ *testing.T, vc *Conn, _ net.Conn) { vc.CancelNotify(nil) },
-			StatusLatched, ErrNotificationLatched,
+			StatusLatched, ErrNotifyLatched,
 		},
 		{
 			"配额耗尽", func(_ *testing.T, vc *Conn, _ net.Conn) { vc.SetReadLimit(0) },
-			StatusQuota, ErrQuotaExhausted,
+			StatusQuota, ErrQuota,
 		},
 		{"延迟错误", func(_ *testing.T, vc *Conn, _ net.Conn) {
 			vc.r.fg.Lock()

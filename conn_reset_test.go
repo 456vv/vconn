@@ -62,8 +62,8 @@ func TestResetNotify_PeerDownNeedsForce(t *testing.T) {
 		t.Fatal("应携带关闭原因")
 	}
 
-	if err := vc.ResetNotify(false); !errors.Is(err, ErrResetPeerDown) {
-		t.Fatalf("期望 ErrResetPeerDown，得到 %v", err)
+	if err := vc.ResetNotify(false); !errors.Is(err, ErrPeerDown) {
+		t.Fatalf("期望 ErrPeerDown，得到 %v", err)
 	}
 	if !vc.IsPeerClosed() {
 		t.Fatal("被拒绝的重置不应改变状态")
@@ -99,8 +99,8 @@ func TestResetNotify_Refusals(t *testing.T) {
 		}
 
 		for _, force := range []bool{false, true} {
-			if err := vc.ResetNotify(force); !errors.Is(err, ErrResetLocallyClosed) {
-				t.Fatalf("force=%v 时应返回 ErrResetLocallyClosed，得到 %v", force, err)
+			if err := vc.ResetNotify(force); !errors.Is(err, ErrLocalClosed) {
+				t.Fatalf("force=%v 时应返回 ErrLocalClosed，得到 %v", force, err)
 			}
 		}
 		if err := awaitErr(t, vc.CloseNotify(), "关闭后再订阅"); !errors.Is(err, net.ErrClosed) {
@@ -114,8 +114,8 @@ func TestResetNotify_Refusals(t *testing.T) {
 
 		vc := New(s1)
 		vc.RawConn()
-		if err := vc.ResetNotify(false); !errors.Is(err, ErrResetLocallyClosed) {
-			t.Fatalf("期望 ErrResetLocallyClosed，得到 %v", err)
+		if err := vc.ResetNotify(false); !errors.Is(err, ErrLocalClosed) {
+			t.Fatalf("期望 ErrLocalClosed，得到 %v", err)
 		}
 	})
 }

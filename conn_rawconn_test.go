@@ -22,14 +22,14 @@ func TestRawConn_Transfer(t *testing.T) {
 
 	select {
 	case err := <-ch:
-		if !errors.Is(err, ErrRawConnAlreadyUsed) {
-			t.Fatalf("通知应为 ErrRawConnAlreadyUsed，得到 %v", err)
+		if !errors.Is(err, ErrInUse) {
+			t.Fatalf("通知应为 ErrInUse，得到 %v", err)
 		}
 	default:
 		t.Fatal("提取原始连接后应同步分发通知")
 	}
-	if k := StatusOf(vc.Err()); k != StatusMisuse {
-		t.Fatalf("Err() 应归类为 StatusMisuse，得到 %v", k)
+	if k := StatusOf(vc.Err()); k != StatusInUse {
+		t.Fatalf("Err() 应归类为 StatusInUse，得到 %v", k)
 	}
 
 	buf := make([]byte, 4)

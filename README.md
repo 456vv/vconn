@@ -123,7 +123,7 @@ case vconn.StatusLatched:
     // 这一轮通知被 CancelNotify / Context 取消锁住
 case vconn.StatusLocalClosed:
     // 本端已经关闭
-case vconn.StatusMisuse, vconn.StatusUnsupported:
+case vconn.StatusInUse, vconn.StatusUnsupported:
     // 用法或平台不支持。修调用，不要重试
 }
 ```
@@ -163,7 +163,7 @@ type Statuser interface {
 | `StatusLatched` | 通知已锁存，连接未必坏 | 否 | 否 | 否 |
 | `StatusQuota` | 读配额用尽 | 否 | 否 | 否 |
 
-后四个只出现在错误分类里，探测方法不会返回它们：`StatusTimeout`、`StatusMisuse`、`StatusUnsupported`、`StatusUnknown`。
+后四个只出现在错误分类里，探测方法不会返回它们：`StatusTimeout`、`StatusInUse`、`StatusUnsupported`、`StatusUnknown`。
 
 几个谓词的关系：
 
@@ -213,9 +213,9 @@ case <-time.After(time.Minute):
 
 | 返回值 | 原因 | 下一步 |
 |---|---|---|
-| `ErrResetPeerDown` | 已经确认对端结束 | 默认丢掉连接。只有确认要再上报一次时才用 `ResetNotify(true)` |
-| `ErrResetLocallyClosed` | 本端已 `Close` 或已取走原连接 | 不能恢复。`force` 也无效 |
-| `ErrResetTimeout` | 上一轮监控还卡在预读里，但锁存已经清空 | 直接重试，不会因此启动第二轮监控 |
+| `ErrPeerDown` | 已经确认对端结束 | 默认丢掉连接。只有确认要再上报一次时才用 `ResetNotify(true)` |
+| `ErrLocalClosed` | 本端已 `Close` 或已取走原连接 | 不能恢复。`force` 也无效 |
+| `ErrBusy` | 上一轮监控还卡在预读里，但锁存已经清空（`StatusBusy`，不是超时） | 直接重试，不会因此启动第二轮监控 |
 
 `CancelNotify` 与 `ResetNotify` 方向相反。前者把「未落定」变成「已落定」，后者把「已落定」变回「未落定」。
 
@@ -252,7 +252,7 @@ c.SetMonitorInterval(100 * time.Millisecond)
 
 - `n < 0`：取消限额；
 - `n >= 0`：之后还可交付给调用方的字节数；
-- 限额用尽返回 `ErrQuotaExhausted`。它满足 `io.EOF`，但 `StatusOf` 给出 `StatusQuota`，不会把连接标成对端已关闭。
+- 限额用尽返回 `ErrQuota`。它满足 `io.EOF`，但 `StatusOf` 给出 `StatusQuota`，不会把连接标成对端已关闭。
 
 `SetMonitorInterval` 是空闲连接两次探测之间的间隔，不是探测的超时。小于等于 `0` 恢复默认 200ms，低于 10ms 会提升到 10ms。正在运行的监控会被立刻唤醒并使用新间隔。
 
@@ -309,7 +309,7 @@ raw, buffered := c.RawConnFull()
 
 `RawConn` 把底层连接交回去，但丢弃本包预读缓冲。`RawConnFull` 会先停掉监控，再取走全部预读字节。调用期间若另有 goroutine 正阻塞在 `Read` 上，那个 `Read` 会被一个过去时间的 deadline 唤醒并返回超时；返回前会恢复调用方原来设置的读超时。
 
-交还后，`vconn.Conn` 的 `Read` / `Write` 返回 `net.ErrClosed`，订阅者收到 `ErrRawConnAlreadyUsed`。底层连接保持打开，关闭责任已经回到调用方。
+交还后，`vconn.Conn` 的 `Read` / `Write` 返回 `net.ErrClosed`，订阅者收到 `ErrInUse`。底层连接保持打开，关闭责任已经回到调用方。
 
 已经通过 `NewData` 放进缓冲、或后台预读得到的字节，都要靠 `RawConnFull` 才能不丢。
 
@@ -334,7 +334,7 @@ Windows 上有一个已知边界：Winsock 经常要到真正 `recv` 时才给�
 | 监控周期 | 200ms，可改，最小 10ms | 只作用于空闲连接 |
 | 阻塞探测超时 | 2ms | `CheckBlocking`、`CheckReusable` 和后台等待型预读 |
 | 无超时兜底 | 10ms | 只在内部调用漏传超时时使用 |
-| 停止监控上限 | 1s | `ResetNotify` 超时后返回 `ErrResetTimeout`，状态已经清空 |
+| 停止监控上限 | 1s | `ResetNotify` 忙时返回 `ErrBusy`，状态已经清空 |
 | 单次缓冲下限 | 4 KiB | 丢弃模式的最小读取块 |
 | 单次缓冲上限 | 1 MiB | `SetBackgroundReadBuffer` 的绝对值上限 |
 | 大缓冲保留上限 | 64 KiB | 超过后、下次只需小缓冲时释放 |

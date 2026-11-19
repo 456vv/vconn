@@ -2,6 +2,7 @@ package vconn
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -44,6 +45,35 @@ func tcpPair(t *testing.T) (*Conn, net.Conn, net.Listener) {
 
 // pipePair 返回一对内存管道连接（无内核探测能力）。
 func pipePair() (net.Conn, net.Conn) { return net.Pipe() }
+
+// pipeWrite 在同步管道（net.Pipe 等无缓冲实现）上写入，并在对端起读者校验收到的字节。
+//
+// net.Pipe 的 Write 会一直阻塞到对端读走，所以「先写、再让对端读」的写法必然死锁；
+// 这里统一成「先起读者 → 再写 → 校验对端收到什么」。
+func pipeWrite(t *testing.T, what string, w io.Writer, peer io.Reader, payload string) {
+	t.Helper()
+
+	readErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, len(payload))
+		if _, err := io.ReadFull(peer, buf); err != nil {
+			readErr <- err
+			return
+		}
+		if string(buf) != payload {
+			readErr <- fmt.Errorf("对端收到 %q，期望 %q", buf, payload)
+			return
+		}
+		readErr <- nil
+	}()
+
+	if _, err := w.Write([]byte(payload)); err != nil {
+		t.Fatalf("%s: 写入失败: %v", what, err)
+	}
+	if err := <-readErr; err != nil {
+		t.Fatalf("%s: 对端读取失败: %v", what, err)
+	}
+}
 
 // ==================== 等待 ====================
 

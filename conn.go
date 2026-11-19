@@ -38,6 +38,12 @@
 //     的错误空间共用同一套答案，一个 switch 就够）。
 //   - 观测轴与处置轴共用类型但问题不同：Readable / Reusable / Ended 讲「连接怎么样」，
 //     Retryable / Terminal 讲「我该怎么做」。
+//   - 错误名与状态名同源：Err[域]状态词[修饰]。
+//     ErrBusy 都属于 StatusBusy，ErrNotifyLatched 与 ErrNotifyCanceled
+//     都属于 StatusLatched —— 只读名字就能猜到 StatusOf 的结论，
+//     因此判定只有一条：switch vconn.StatusOf(err).Class()，
+//     或等价的 if vconn.StatusBusy.Is(err)。完整对照表见 kind.go 的映射表，
+//     命名契约由 status_test.go 的 errNamingTable 守着。
 //
 // 类型与常量的定义在 state.go，「错误 → Status」的映射在 kind.go。
 //
@@ -62,6 +68,7 @@ package vconn
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -77,7 +84,29 @@ type CloseNotifier interface {
 	CloseNotify() <-chan error
 }
 
+// ==================== 错误哨兵 ====================
+//
+// 命名规则（新增导出错误必须遵守，status_test.go 的 errNamingTable 盯着它）：
+//
+//	Err[域]状态词[修饰]
+//	  域     = Reset / Notify —— 只被某一个方法返回的错误才加域前缀；
+//	  状态词 = Status 的名字（busy / latched / peer-closed / local-closed / ...）。
+//
+// 由此得到两条永不漂移的判定路径（Status.Is 就是 StatusOf 的糖）：
+//
+//	switch vconn.StatusOf(err).Class() { ... } // 唯一权威
+//	if vconn.StatusBusy.Is(err) { ... }        // 等价，更好读
+//
+// 两类豁免（在 errNamingTable 里显式标空并写明理由）：
+//   - 表达「为什么」而不是「哪一类」的名字：ErrNotifyCanceled、
+//     伞错误 ErrNotReusable —— 必须配 StatusOf；
+//   - 用法/平台错误：ErrUnsupported、ErrInUse —— 名字本身就是类别名。
+//
+// 本文件按类别分组；池化专用哨兵（ErrNotifyLatched / ErrDataPending / ErrUnverified /
+// ErrBusy / ErrQuota / ErrNotReusable）在 reuse.go，同样按类别分组。
 var (
+	// —— 类别：StatusPeerClosed ——
+
 	// ErrPeerClosedWithUnread 对端已正常结束（FIN），但仍有未读数据
 	// （可能在内核接收队列，也可能在 vconn 的预读缓冲区里）。
 	//
@@ -94,58 +123,64 @@ var (
 	//		// 队列已读空的干净结束 → 可直接 Close
 	//	}
 	//
-	// 对应的状态类别：StatusPeerClosed（带 unread 修饰时为 StatusPeerClosedWithUnread）。
+	// 类别：StatusPeerClosed（带 unread 修饰时为 StatusPeerClosedWithUnread）。
 	ErrPeerClosedWithUnread = errors.New("vconn: peer closed with unread data")
 
-	// ErrRawConnAlreadyUsed 表示原始连接已被提取，当前包装连接失效。
+	// ErrPeerDown 已探测到对端断开（或正常/异常结束），默认不允许重置通知状态；
+	// 确认要重新武装请使用 ResetNotify(true)。
 	//
-	// 触发场景：
-	//   - 重复调用 RawConn / RawConnFull（这会 panic，不是返回本错误）；
-	//   - RawConn 提取所有权后，原包装连接的分发通知以本错误作为关闭原因。
+	// 之所以要确认：连接池回收路径上，「对端下线」往往正是应该丢弃这条连接的理由，
+	// 无脑重置会让一条已死的连接重新进入池子。
 	//
-	// 对应的状态类别：StatusMisuse。
-	ErrRawConnAlreadyUsed = errors.New("vconn: the original connection has already been extracted and cannot be used")
+	// 名字里的 PeerDown 与 Status.PeerDown() 谓词同义（对端已下线）。
+	// 注意它**只由 ResetNotify 返回**，表达的是「这一轮重置被拒绝」，
+	// 不是「对端已下线」的通用哨兵：Read/Write 永远不会返回它
+	// （它们给 io.EOF / ErrPeerClosedWithUnread）；且 Status.PeerDown() 对
+	// StatusPeerClosed 与 StatusPeerReset 都为真，不是独立的类别词。
+	// 类别：StatusPeerClosed。
+	ErrPeerDown = errors.New("vconn: cannot reset close notification after peer was detected down")
+
+	// —— 类别：StatusLocalClosed ——
+
+	// ErrLocalClosed 连接已被本地关闭（Close / RawConn），不可重置通知状态。
+	//
+	// 这是 ResetNotify 不可逾越的边界：底层连接已经不可用，重新武装没有意义。
+	//
+	// 类别：StatusLocalClosed。
+	ErrLocalClosed = errors.New("vconn: cannot reset close notification on a locally closed connection")
+
+	// —— 类别：StatusLatched ——
 
 	// ErrNotifyCanceled CancelNotify(nil) 时写入关闭理由的哨兵错误。
 	//
 	// CancelNotify 传入 nil 时用它兜底，避免把「收到 nil 错误」这种不确定语义
 	// 交给订阅者。也用于 WithContext 取消时规整自定义 Context 违反契约的情况。
 	//
-	// 对应的状态类别：StatusLatched（表示「这一轮等待被撤销」，连接本身未必坏）。
+	// 类别：StatusLatched（表示「这一轮等待被撤销」，连接本身未必坏）。
+	// 名字刻意用 Canceled 而不是 Latched：它描述的是「为什么锁存」，与
+	// reuse.go 的 ErrNotifyLatched（「已经锁存、需要 ResetNotify」）分工不同、类别相同。
 	ErrNotifyCanceled = errors.New("vconn: close notification canceled by CancelNotify")
+
+	// —— 类别：StatusInUse ——
+
+	// ErrInUse 表示原始连接已被提取，当前包装连接失效。
+	//
+	// 触发场景：
+	//   - 重复调用 RawConn / RawConnFull（这会 panic，不是返回本错误）；
+	//   - RawConn 提取所有权后，原包装连接的分发通知以本错误作为关闭原因。
+	//
+	// 类别：StatusInUse（名字本身就是类别名，属命名规则的豁免）。
+	ErrInUse = errors.New("vconn: the original connection has already been extracted and cannot be used")
+
+	// —— 类别：StatusUnsupported ——
 
 	// ErrUnsupported 平台或底层连接不支持该操作。
 	//
 	// 例如对 net.Pipe 调用 SetKeepAlive / SetLinger / CloseWrite 等可选方法，
 	// 或在拿不到 fd 的连接上做内核级探测。
 	//
-	// 对应的状态类别：StatusUnsupported。
+	// 类别：StatusUnsupported（名字本身就是类别名，属命名规则的豁免）。
 	ErrUnsupported = errors.New("vconn: operation not supported")
-
-	// ErrResetLocallyClosed 连接已被本地关闭（Close / RawConn），不可重置通知状态。
-	//
-	// 这是 ResetNotify 不可逾越的边界：底层连接已经不可用，重新武装没有意义。
-	//
-	// 对应的状态类别：StatusLocalClosed。
-	ErrResetLocallyClosed = errors.New("vconn: cannot reset close notification on a locally closed connection")
-
-	// ErrResetPeerDown 已探测到对端断开（或正常/异常结束），默认不允许重置通知状态；
-	// 确认要重新武装请使用 ResetNotify(true)。
-	//
-	// 之所以要确认：连接池回收路径上，「对端下线」往往正是应该丢弃这条连接的理由，
-	// 无脑重置会让一条已死的连接重新进入池子。
-	//
-	// 对应的状态类别：StatusPeerClosed（真实状态是对端结束，只是这一轮不能重新武装）。
-	ErrResetPeerDown = errors.New("vconn: cannot reset close notification after peer was detected down")
-
-	// ErrResetTimeout 上一轮监控协程未能在时限内退出，重置未完成；
-	// 状态已清空，可直接重试 ResetNotify（不会重复启动监控）。
-	//
-	// 出现原因：上一轮监控正卡在阻塞式预读里，没能在 monitorStopTimeout 内退出。
-	// 这属于「忙」而非「坏」，稍后重试即可。
-	//
-	// 对应的状态类别：StatusBusy。
-	ErrResetTimeout = errors.New("vconn: previous monitor goroutine did not exit in time")
 )
 
 // 内部时序参数
@@ -450,14 +485,14 @@ func snapshotAddr(a net.Addr) net.Addr {
 //
 //   - 提取之后，本 Conn 不再拥有底层 fd：Close 不再关闭它；
 //   - 提取之后，本 Conn 的读写路径全部失效（Read/Write 返回 net.ErrClosed）；
-//   - 提取只能发生一次：重复调用 panic（ErrRawConnAlreadyUsed）；
-//   - 提取时会分发一次 kindLocal 通知，原因是 ErrRawConnAlreadyUsed，
+//   - 提取只能发生一次：重复调用 panic（ErrInUse）；
+//   - 提取时会分发一次 kindLocal 通知，原因是 ErrInUse，
 //     告诉订阅者「连接已经不属于 vconn 了」。
 
 // RawConn 剥离包装，归还底层真实连接
 //
 // 剥离后，此 Conn 无法再读写，任何操作将返回 net.ErrClosed
-// 该方法只能调用一次，重复调用会 panic（ErrRawConnAlreadyUsed）
+// 该方法只能调用一次，重复调用会 panic（ErrInUse）
 //
 // 与 Close 的区别：Close 会关闭底层连接；RawConn 只「解除所有权」，
 // 底层连接仍然打开，调用方拿到后可以继续使用（这也是它不关闭底层的原因）。
@@ -468,7 +503,7 @@ func (c *Conn) RawConn() net.Conn {
 	c.mu.Lock()
 	if c.rawUsed.Load() {
 		c.mu.Unlock()
-		panic(ErrRawConnAlreadyUsed)
+		panic(ErrInUse)
 	}
 	c.rawUsed.Store(true)
 	if c.closed.Load() {
@@ -482,11 +517,13 @@ func (c *Conn) RawConn() net.Conn {
 		// Close 会先 close(done) 再 stopMonitor；这里再确认一次监控已退出，
 		// 保证返回 rwc 后不会再有探测协程访问同一 fd。
 		c.finishLocalClose()
+		c.r.takePeek()
 		return c.rwc
 	}
 	c.closed.Store(true)
 	c.mu.Unlock()
 	c.finishLocalClose()
+	c.r.takePeek()
 	return c.rwc
 }
 
@@ -496,7 +533,7 @@ func (c *Conn) RawConn() net.Conn {
 // （订阅者收到通知时，连接已经彻底不可用了）。
 func (c *Conn) finishLocalClose() {
 	c.stopMonitor()
-	c.notifyClose(ErrRawConnAlreadyUsed, kindLocal)
+	c.notifyClose(ErrInUse, kindLocal)
 }
 
 // RawConnFull 归还原始连接，并返回后台已预读但尚未被读取的字节
@@ -584,16 +621,16 @@ func (c *Conn) SetBackgroundReadBuffer(n int) {
 
 // SetReadLimit 设置读取限制字节数
 // remain < 0: 不限制
-// remain >= 0: 限制剩余可读字节数，超出后返回 ErrQuotaExhausted
+// remain >= 0: 限制剩余可读字节数，超出后返回 ErrQuota
 // （它用 %w 包住 io.EOF，按 io.EOF 判定与比较的语义不变；
-// 想区分「配额用尽」与「对端关闭」请用 errors.Is(err, ErrQuotaExhausted)
+// 想区分「配额用尽」与「对端关闭」请用 errors.Is(err, ErrQuota)
 // 或 StatusOf(err) == StatusQuota）。配额耗尽不会触发关闭通知。
 //
 // 语义：这是一个「读多少字节」的闸门，不是「连接最多存活多久」。
 // 配额按**实际交付给调用方的字节数**扣减（包含从预读缓冲区取走的部分），
 // 并发调用下用 CAS 扣减，不会超发。
 //
-// 配额耗尽后：Read 立即返回 ErrQuotaExhausted（不再触碰 socket），
+// 配额耗尽后：Read 立即返回 ErrQuota（不再触碰 socket），
 // 且**不会**落定 peerDown —— 因为对端并没有断开。
 // 需要恢复读能力请重新调用 SetReadLimit。
 func (c *Conn) SetReadLimit(remain int64) {
@@ -639,7 +676,7 @@ func (c *Conn) SetMonitorInterval(d time.Duration) {
 //	对端断开/网络异常：io.EOF（干净 FIN）、ECONNRESET 等（异常中断）、
 //	                  或 ErrPeerClosedWithUnread（对端已结束但还有未读数据）
 //	本地 Close：net.ErrClosed
-//	原始连接被提取：ErrRawConnAlreadyUsed
+//	原始连接被提取：ErrInUse
 //	手动取消：调用方传入的错误（nil 时用 ErrNotifyCanceled）
 //
 // 重要：通知只「告知」，不关闭底层连接。收到通知后是否 Close 由调用方决定
@@ -680,7 +717,7 @@ func (c *Conn) WatchClose() (<-chan error, func()) {
 		// 提取原始连接后 closeErr 可能尚未写入（RawConn 与 WatchClose 并发）：
 		// 这里补一个确定的原因，避免把 nil 交给订阅者。
 		if err == nil && c.rawUsed.Load() {
-			err = ErrRawConnAlreadyUsed
+			err = ErrInUse
 		}
 		c.mu.Unlock()
 		sig.fire(err)
@@ -731,8 +768,11 @@ func (c *Conn) CancelNotify(err error) bool {
 // ResetNotify 清除已落定的关闭通知状态，使连接可以再次被订阅并再次收到通知。
 //
 // ResetNotify(false) 是常规重置，保留两条安全边界：
-//   - 本地已 Close / RawConn 提取过（底层不可再用）→ ErrResetLocallyClosed
-//   - 已探测到对端断开（需确认连接仍然可用）→ ErrResetPeerDown
+//   - 本地已 Close / RawConn 提取过（底层不可再用）→ ErrLocalClosed
+//   - 已探测到对端断开（需确认连接仍然可用）→ ErrPeerDown
+//
+// 若上一轮监控没能在时限内退出（忙），返回 ErrBusy —— 锁存已经清空，
+// 直接重试即可（StatusBusy，不是 StatusTimeout）。
 //
 // ResetNotify(true) 是「重新武装」：越过第二条边界（peerDown）。语义上清空
 // closeErr/peerDown 后，新的监控会立刻重新探测到底层仍是断开状态，并再次分发通知。
@@ -749,16 +789,16 @@ func (c *Conn) CancelNotify(err error) bool {
 // （已有存活实例时内部直接返回），不会打断正在工作的监控，也不会做无谓的 stop/start。
 //
 // 与其它方法的并发关系：可与 WatchClose/CancelNotify/Close 并发调用；
-// 与 Close 竞争时以最终状态为准——本地已关闭后重置会返回 ErrResetLocallyClosed。
+// 与 Close 竞争时以最终状态为准——本地已关闭后重置会返回 ErrLocalClosed。
 func (c *Conn) ResetNotify(force bool) error {
 	c.mu.Lock()
 	if c.closed.Load() || c.rawUsed.Load() {
 		c.mu.Unlock()
-		return ErrResetLocallyClosed
+		return ErrLocalClosed
 	}
 	if c.peerDown && !force {
 		c.mu.Unlock()
-		return ErrResetPeerDown
+		return ErrPeerDown
 	}
 	if !c.notified.Load() && c.closeErr == nil && !c.peerDown {
 		// 本来就是"未落定"状态：幂等返回，不动正在工作的监控。
@@ -784,8 +824,9 @@ func (c *Conn) ResetNotify(force bool) error {
 	// 先等上一轮监控收尾，再起新一轮：
 	// 两代监控同时存活时，阻塞预读可能互相覆盖 ReadDeadline。
 	if !c.stopMonitor() {
-		// 状态已清空，监控会在底层读超时后自行退出；调用方可直接重试
-		return ErrResetTimeout
+		// 状态已清空，监控会在底层读超时后自行退出；调用方可直接重试。
+		// 返回 ErrBusy（StatusBusy），不是「Timeout」：连接没坏，只是忙。
+		return fmt.Errorf("%w: previous monitor goroutine did not exit in %s", ErrBusy, monitorStopTimeout)
 	}
 	c.startMonitor()
 	return nil
@@ -974,7 +1015,9 @@ func (c *Conn) recordProbe(err error) error {
 
 // Read 从连接读取数据，实现 io.Reader，并发安全。
 //
-// 交付顺序固定为：上次遗留的终止错误、读取配额、预读缓冲、底层 Read。
+// 交付顺序固定为：遗留终止错误（仅当预读为空时补交）、读取配额、预读缓冲、
+// 本地关闭、底层 Read。只要预读缓冲交付了字节，本方法就立即返回 (n, nil)，
+// 不会为了填满 p 再去读 socket —— 已到手的字节不会被一次可能阻塞的读扣住。
 // 已经从内核取出的字节一定先交给调用方；有数据时按 io.Reader 惯例返回
 // (n, nil)，终止错误留到下一次调用。
 //
@@ -982,7 +1025,7 @@ func (c *Conn) recordProbe(err error) error {
 // 必须交由 connReader.Read 先交付；只有缓冲区为空且连接已关闭时才报
 // net.ErrClosed。关闭后的 Read 不是热路径，这点开销可以接受。
 //
-// 配额耗尽返回 ErrQuotaExhausted。它满足 io.EOF，但不是对端关闭，
+// 配额耗尽返回 ErrQuota。它满足 io.EOF，但不是对端关闭，
 // 不会把连接标记为 peerDown，也不会分发关闭通知。
 func (c *Conn) Read(b []byte) (n int, err error) {
 	n, err = c.r.Read(b)
@@ -990,10 +1033,10 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 		return n, nil // 有数据时优先返回数据，错误留到下一次（io.Reader 惯例）
 	}
 	if err != nil {
-		// 配额耗尽（ErrQuotaExhausted）用 %w 包住了 io.EOF，但它不是「对端关闭」：
+		// 配额耗尽（ErrQuota）用 %w 包住了 io.EOF，但它不是「对端关闭」：
 		// 那是调用方自己设的上限，不能借此落定 peerDown，否则 IsPeerClosed /
 		// Status / CloseNotify 会一起撒谎（池化代码会因此误判连接已死）。
-		if isCommonNetError(err) && !errors.Is(err, ErrQuotaExhausted) {
+		if isCommonNetError(err) && !errors.Is(err, ErrQuota) {
 			c.notifyRemote(err)
 		}
 	}

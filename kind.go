@@ -72,18 +72,29 @@ type Statuser interface {
 //
 //	StatusAlive        nil
 //	StatusPeerClosed   io.EOF / ErrPeerClosedWithUnread / peerClosedWithUnreadError{} /
-//	                   ErrResetPeerDown（已断但要先 drain 的那类）
+//	                   ErrPeerDown（ResetNotify 被拒：对端已下线，故归本类）
 //	StatusPeerReset    io.ErrUnexpectedEOF / ECONNRESET / EPIPE / ENETUNREACH / 超时类断链
-//	StatusLocalClosed  net.ErrClosed / io.ErrClosedPipe / ErrResetLocallyClosed
-//	StatusDataPending  ErrConnDirty
-//	StatusBusy         ErrBusy / ErrResetTimeout
-//	StatusLatched      ErrNotificationLatched / ErrNotifyCanceled / context.Canceled
+//	StatusLocalClosed  net.ErrClosed / io.ErrClosedPipe / ErrLocalClosed
+//	StatusDataPending  ErrDataPending
+//	StatusBusy         ErrBusy
+//	StatusLatched      ErrNotifyLatched / ErrNotifyCanceled / context.Canceled
 //	StatusUnverified   ErrUnverified
-//	StatusQuota        ErrQuotaExhausted
+//	StatusQuota        ErrQuota
 //	StatusTimeout      os.ErrDeadlineExceeded / context.DeadlineExceeded / net.Error.Timeout()
-//	StatusMisuse       ErrRawConnAlreadyUsed
+//	StatusInUse       ErrInUse
 //	StatusUnsupported  ErrUnsupported
 //	StatusUnknown      ErrNotReusable 裸用 / 自定义错误
+//
+// 表里每一行的哨兵，名字都带着所属类别的状态词（ErrBusy → StatusBusy），
+// 所以「读名字猜类别」与实际分类一致；该契约由 status_test.go 的 errNamingTable
+// 守着（Status.String() 的词干必须出现在名字里，或显式标注豁免理由）。
+//
+// 只想判「是否属于某类别」时用 Status.Is(err)，它等价于本函数的 Class() 比较：
+//
+//	if vconn.StatusBusy.Is(err) {
+//		backoff()
+//		continue
+//	}
 //
 // 与 Check* 的关系（status_test.go 里的不变量测试）：
 // err 非 nil 时 StatusOf(err).Class() 应与 Check* 返回的类别相同；
@@ -101,7 +112,7 @@ func StatusOf(err error) Status {
 
 	switch {
 	// 配额耗尽要先于 io.EOF 判定：它是「调用方自己设的上限」，不是对端关闭。
-	case errors.Is(err, ErrQuotaExhausted):
+	case errors.Is(err, ErrQuota):
 		return StatusQuota
 
 	// 流在中途被截断：对端没有正常收尾，不能算 StatusPeerClosed。
@@ -113,16 +124,16 @@ func StatusOf(err error) Status {
 		return StatusPeerClosed
 
 	// 本地已关闭（含管道：net.Pipe 本地端关闭时 Read/SetReadDeadline 返回 io.ErrClosedPipe）。
-	case errors.Is(err, net.ErrClosed), errors.Is(err, io.ErrClosedPipe), errors.Is(err, ErrResetLocallyClosed):
+	case errors.Is(err, net.ErrClosed), errors.Is(err, io.ErrClosedPipe), errors.Is(err, ErrLocalClosed):
 		return StatusLocalClosed
 
-	case errors.Is(err, ErrConnDirty):
+	case errors.Is(err, ErrDataPending):
 		return StatusDataPending
 
-	case errors.Is(err, ErrBusy), errors.Is(err, ErrResetTimeout):
+	case errors.Is(err, ErrBusy):
 		return StatusBusy
 
-	case errors.Is(err, ErrNotificationLatched), errors.Is(err, ErrNotifyCanceled), errors.Is(err, context.Canceled):
+	case errors.Is(err, ErrNotifyLatched), errors.Is(err, ErrNotifyCanceled), errors.Is(err, context.Canceled):
 		// 上下文取消走的是"手动通知"路径：连接本身未必坏，
 		// 只是这一轮等待被撤销了（需要 ResetNotify 才能重新武装）。
 		return StatusLatched
@@ -130,13 +141,13 @@ func StatusOf(err error) Status {
 	case errors.Is(err, ErrUnverified):
 		return StatusUnverified
 
-	case errors.Is(err, ErrRawConnAlreadyUsed):
-		return StatusMisuse
+	case errors.Is(err, ErrInUse):
+		return StatusInUse
 
 	case errors.Is(err, ErrUnsupported):
 		return StatusUnsupported
 
-	case errors.Is(err, ErrResetPeerDown):
+	case errors.Is(err, ErrPeerDown):
 		// 重置被拒是因为「已经探测到对端下线」：真实状态是对端结束，
 		// 只是这一轮通知不能重新武装。
 		return StatusPeerClosed

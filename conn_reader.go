@@ -114,8 +114,10 @@ func (r *connReader) Read(p []byte) (n int, err error) {
 	r.fg.Lock()
 	defer r.fg.Unlock()
 
-	// 上次读取遗留的错误（如 EOF），在没有新数据时补交给调用方
-	if r.pending != nil {
+	// 1. 上次读取遗留的终止错误：早于配额判定（与 CheckReusable 的顺序一致），
+	//    但晚于预读字节 —— 预读里的字节在流顺序上排在它之前，有预读时先交付数据，
+	//    pending 留到下一次。hasPeek 只在 pending 非 nil 时调用，热路径零开销。
+	if r.pending != nil && !r.hasPeek() {
 		err = r.pending
 		r.pending = nil
 		// 同样经过连接级规整：pending 可能是 net.ErrClosed，而对端实际是异常断开
@@ -126,23 +128,21 @@ func (r *connReader) Read(p []byte) (n int, err error) {
 		return 0, err
 	}
 
-	// 1. 处理 Read Limit 限流控制
+	// 2. 读取配额：配额是「允许交付多少字节」的闸门，必须先截断 p，
+	//    因此它排在预读拷贝之前（limit == 0 时预读字节也不交付，留在缓冲里）。
 	limit := r.readLimit.Load()
 	if limit == 0 {
 		// 用哨兵而不是裸 io.EOF：StatusOf 能把它与「对端关闭」区分开
 		// （StatusQuota vs StatusPeerClosed），否则池化代码会为一次配额用尽
 		// 去重连。哨兵用 %w 包住 io.EOF，按 io.EOF 判定的语义不变。
-		return 0, ErrQuotaExhausted
+		return 0, ErrQuota
 	}
 	if limit > 0 && int64(len(p)) > limit {
 		p = p[:limit]
 	}
 
-	// 2. 优先消费后台已预读的字节。
-	//
-	// 这里不使用原子标志做快路径：标志与切片可能不同步，会让「看到的数据」
-	// 与「交付的数据」不一致（乱序或滞留）。peekMu 是未竞争互斥锁（约 15ns），
-	// 换取严格一致性。
+	// 3. 预读缓冲优先：拿到字节就立即返回，绝不为了凑满 p 再向 socket 发起
+	//    一次可能阻塞的读（那会把已经到手的字节扣到 deadline 甚至永久）。
 	r.peekMu.Lock()
 	if len(r.peek) > 0 {
 		cn := copy(p, r.peek)
@@ -151,27 +151,22 @@ func (r *connReader) Read(p []byte) (n int, err error) {
 			r.peek = nil
 		}
 		n += cn
-		p = p[cn:]
 	}
 	r.peekMu.Unlock()
 
-	if len(p) == 0 {
+	if n > 0 {
 		r.consumeLimit(n, limit)
 		return n, nil
 	}
 
-	// 3. 已关闭则直接返回（注意：预读字节已在上面交付，不会被丢弃）
+	// 4. 本地已关闭（走到这里预读必为空，不会有数据被丢弃）
 	if r.conn.closed.Load() {
-		r.consumeLimit(n, limit)
-		if n > 0 {
-			return n, nil
-		}
 		return 0, net.ErrClosed
 	}
 
-	// 4. 真实网络读取（前台独占，不会被后台预读打断）
+	// 5. 真实网络读取（前台独占，不会被后台预读打断）
 	rn, rerr := r.conn.rwc.Read(p)
-	n += rn
+	n = rn
 	if rn > 0 {
 		// 无条件计数：监控启动前的读也必须计入，否则首轮会把活跃连接误判为空闲。
 		//
@@ -179,9 +174,9 @@ func (r *connReader) Read(p []byte) (n int, err error) {
 		// "内核 socket 上最近有没有读活动"，用于决定监控是否值得做零消耗内核探测。
 		r.conn.readSeq.Add(1)
 	}
-	// 注意：这里必须按本次返回的总字节数 n 扣减。
-	// n 可能包含「预读缓冲区消费的 cn + 底层读到的 rn」，只扣 rn 会让
-	// SetReadLimit 被预读字节绕过（上限变成 limit+len(peek)）。
+	// 配额按「实际交付给调用方的字节数」扣减。预读已在第 3 步提前返回，
+	// 此处 n == rn；仍用 n 而非 rn，是为了让将来有人重新引入「预读 + socket
+	// 同一次交付」时，不会悄悄退化成「配额被预读字节绕过」。
 	r.consumeLimit(n, limit)
 
 	if rerr != nil {

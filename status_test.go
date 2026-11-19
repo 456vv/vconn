@@ -26,35 +26,34 @@ func TestStatusOf_GoldenTable(t *testing.T) {
 		{"peerClosedWithUnreadError", peerClosedWithUnreadError{}, StatusPeerClosed},
 		{"peerClosedWithUnread+cause", peerClosedWithUnreadError{cause: syscall.ECONNRESET}, StatusPeerReset},
 		{"io.EOF", io.EOF, StatusPeerClosed},
-		{"ErrResetPeerDown", ErrResetPeerDown, StatusPeerClosed},
+		{"ErrPeerDown", ErrPeerDown, StatusPeerClosed},
 		{"io.ErrUnexpectedEOF", io.ErrUnexpectedEOF, StatusPeerReset},
 
 		// —— 链式包装 ——
 		{"notReusable(io.EOF)", notReusable(io.EOF), StatusPeerClosed},
 		{"notReusable(WithUnread)", notReusable(ErrPeerClosedWithUnread), StatusPeerClosed},
-		{"notReusable(ErrConnDirty)", notReusable(ErrConnDirty), StatusDataPending},
+		{"notReusable(ErrDataPending)", notReusable(ErrDataPending), StatusDataPending},
 		{"notReusable(ErrBusy)", notReusable(ErrBusy), StatusBusy},
 		{"notReusable(ErrUnverified)", notReusable(ErrUnverified), StatusUnverified},
-		{"notReusable(ErrNotificationLatched)", notReusable(ErrNotificationLatched), StatusLatched},
-		{"notReusable(ErrQuotaExhausted)", notReusable(ErrQuotaExhausted), StatusQuota},
+		{"notReusable(ErrNotifyLatched)", notReusable(ErrNotifyLatched), StatusLatched},
+		{"notReusable(ErrQuota)", notReusable(ErrQuota), StatusQuota},
 		{"notReusable(net.ErrClosed)", notReusable(net.ErrClosed), StatusLocalClosed},
 
 		// —— 本地关闭 ——
 		{"net.ErrClosed", net.ErrClosed, StatusLocalClosed},
 		{"io.ErrClosedPipe", io.ErrClosedPipe, StatusLocalClosed},
-		{"ErrResetLocallyClosed", ErrResetLocallyClosed, StatusLocalClosed},
+		{"ErrLocalClosed", ErrLocalClosed, StatusLocalClosed},
 
 		// —— 复用判定 ——
-		{"ErrConnDirty", ErrConnDirty, StatusDataPending},
+		{"ErrDataPending", ErrDataPending, StatusDataPending},
 		{"ErrBusy", ErrBusy, StatusBusy},
-		{"ErrResetTimeout", ErrResetTimeout, StatusBusy},
 		{"ErrUnverified", ErrUnverified, StatusUnverified},
-		{"ErrNotificationLatched", ErrNotificationLatched, StatusLatched},
+		{"ErrNotifyLatched", ErrNotifyLatched, StatusLatched},
 		{"ErrNotifyCanceled", ErrNotifyCanceled, StatusLatched},
-		{"ErrQuotaExhausted", ErrQuotaExhausted, StatusQuota},
+		{"ErrQuota", ErrQuota, StatusQuota},
 
 		// —— 用法 / 不支持 ——
-		{"ErrRawConnAlreadyUsed", ErrRawConnAlreadyUsed, StatusMisuse},
+		{"ErrInUse", ErrInUse, StatusInUse},
 		{"ErrUnsupported", ErrUnsupported, StatusUnsupported},
 		{"ErrNotReusable(裸)", ErrNotReusable, StatusUnknown},
 
@@ -126,9 +125,9 @@ var statusRows = []statusRow{
 	{StatusUnverified, "unverified", false, false, false, false, true, false, false},
 	{StatusBusy, "busy", false, false, false, false, true, false, false},
 	{StatusLatched, "latched", false, false, false, false, false, false, false},
-	{StatusQuota, "quota-exhausted", false, false, false, false, false, true, false},
+	{StatusQuota, "quota", false, false, false, false, false, true, false},
 	{StatusTimeout, "timeout", false, false, false, false, true, false, true},
-	{StatusMisuse, "misuse", false, false, false, false, false, false, true},
+	{StatusInUse, "in-use", false, false, false, false, false, false, true},
 	{StatusUnsupported, "unsupported", false, false, false, false, false, false, true},
 	{StatusUnknown, "unknown", false, false, false, false, false, false, true},
 }
@@ -229,7 +228,7 @@ func TestStatusOf_TerminationContract(t *testing.T) {
 		net.ErrClosed,
 		io.ErrClosedPipe,
 		syscall.ECONNRESET,
-		ErrResetPeerDown,
+		ErrPeerDown,
 	} {
 		if st := StatusOf(err); !st.Ended() || !st.Terminal() {
 			t.Fatalf("StatusOf(%v) = %v：断链类错误必须 Ended 且 Terminal", err, st)
@@ -242,8 +241,8 @@ func TestStatusOf_TerminationContract(t *testing.T) {
 		context.DeadlineExceeded,
 		ErrBusy,
 		ErrUnverified,
-		ErrNotificationLatched,
-		ErrRawConnAlreadyUsed,
+		ErrNotifyLatched,
+		ErrInUse,
 		ErrUnsupported,
 	} {
 		if st := StatusOf(err); st.Ended() {
@@ -251,7 +250,7 @@ func TestStatusOf_TerminationContract(t *testing.T) {
 		}
 	}
 
-	for _, err := range []error{ErrConnDirty, ErrQuotaExhausted} {
+	for _, err := range []error{ErrDataPending, ErrQuota} {
 		if st := StatusOf(err); st.Ended() || !st.Terminal() {
 			t.Fatalf("StatusOf(%v) = %v：应「终结但未结束」", err, st)
 		}
@@ -320,5 +319,44 @@ func TestTerminalReadErr_KeepsCause(t *testing.T) {
 	vc.mu.Unlock()
 	if err := vc.terminalReadErr(net.ErrClosed); err != io.EOF {
 		t.Fatalf("干净 FIN 时应归一为 io.EOF，得到 %v", err)
+	}
+}
+
+// TestStatus_Is Status.Is 必须与 StatusOf 永远等价（且只比较类别）
+func TestStatus_Is(t *testing.T) {
+	cases := []struct {
+		st   Status
+		err  error
+		want bool
+	}{
+		{StatusAlive, nil, true},
+		{StatusPeerClosed, io.EOF, true},
+		{StatusPeerClosed, ErrPeerClosedWithUnread, true}, // 带 unread 修饰也命中类别
+		{StatusPeerReset, peerClosedWithUnreadError{cause: syscall.ECONNRESET}, true},
+		{StatusPeerClosed, peerClosedWithUnreadError{cause: syscall.ECONNRESET}, false},
+		{StatusBusy, ErrBusy, true},
+		{StatusLatched, ErrNotifyLatched, true},
+		{StatusLatched, ErrNotifyCanceled, true},
+		{StatusDataPending, ErrDataPending, true},
+		{StatusQuota, ErrQuota, true},
+		{StatusLocalClosed, notReusable(net.ErrClosed), true}, // 穿透伞错误
+		{StatusPeerClosed, notReusable(io.EOF), true},
+		{StatusUnknown, errors.New("boom"), true},
+		{StatusBusy, io.EOF, false},
+	}
+
+	for _, c := range cases {
+		if got := c.st.Is(c.err); got != c.want {
+			t.Fatalf("%v.Is(%v) = %v，期望 %v", c.st, c.err, got, c.want)
+		}
+		// 等价性：Is 就是 StatusOf(...).Class() 的比较
+		if got := StatusOf(c.err).Class() == c.st.Class(); got != c.want {
+			t.Fatalf("%v.Is(%v) 与 StatusOf 的类别不一致", c.st, c.err)
+		}
+	}
+
+	// 带 unread 修饰的状态只比类别，因此结论与不带修饰时相同
+	if !StatusPeerClosedWithUnread.Is(io.EOF) {
+		t.Fatal("StatusPeerClosedWithUnread.Is(io.EOF) 应为 true：Is 只比较类别")
 	}
 }
