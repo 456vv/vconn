@@ -45,7 +45,14 @@ func probeConn(c net.Conn) (probeResult, error) {
 	return res, rerr
 }
 
-// probeFDPoll 对单个 fd 做一次零消耗探测（调用方需保证 fd 有效）
+// probeFDPoll 对单个 fd 做一次零消耗探测（调用方需保证 fd 在本次 Control 回调内有效）。
+//
+// 事件位只负责回答「要不要再看一眼」，最终结论以 MSG_PEEK 为准：
+//   - POLLIN 在 BSD 上既可能是数据，也可能是队列已空的 FIN；
+//   - POLLRDHUP/POLLHUP 在 Linux 上可能和未读数据同时出现；
+//   - POLLNVAL 表示 fd 已经失效，按断开上报，让调用方停止继续探测这个 fd。
+//
+// EINTR 不当成断开：这次探测被信号打断，连接状态并没有变化，下一轮再看。
 func probeFDPoll(fd int) (probeResult, error) {
 	pfd := []unix.PollFd{{
 		Fd:     int32(fd),

@@ -266,6 +266,44 @@ func TestWatchClose(t *testing.T) {
 		_, cancel := vc.WatchClose() // 已落定：退订函数是 no-op，但不得 panic
 		cancel()
 	})
+
+	t.Run("退订只移除自己", func(t *testing.T) {
+		s1, s2 := pipePair()
+		defer s2.Close()
+
+		vc := New(s1)
+		defer vc.Close()
+
+		chA, cancelA := vc.WatchClose()
+		chB, cancelB := vc.WatchClose()
+		defer cancelB()
+		if n := watcherCount(vc); n != 2 {
+			t.Fatalf("期望 2 个订阅者，得到 %d", n)
+		}
+
+		cancelA()
+		select {
+		case _, ok := <-chA:
+			if ok {
+				t.Fatal("被退订的 channel 应被关闭且不携带错误")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("被退订的 channel 未关闭")
+		}
+		if n := watcherCount(vc); n != 1 {
+			t.Fatalf("退订后应只剩 1 个订阅者，得到 %d", n)
+		}
+
+		vc.CancelNotify(errors.New("keep-b"))
+		select {
+		case err := <-chB:
+			if err == nil || err.Error() != "keep-b" {
+				t.Fatalf("未退订的订阅者应收到通知，得到 %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("未退订的订阅者没有收到通知")
+		}
+	})
 }
 
 // TestNotify_WithContext 上下文集成：只通知 vs 取消即关闭

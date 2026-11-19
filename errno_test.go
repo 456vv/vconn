@@ -9,7 +9,7 @@ import (
 )
 
 // TestIsNetErrno_RejectsGenericErrno 通用参数错误不能被当成「对端已断开」。
-// 旧实现把 EINVAL 列入断开错误表，会让健康连接被标记为 peerDown
+// 若把 EINVAL 列入断开错误表，会让健康连接被标记为 peerDown
 // 并向订阅者发出假的关闭通知。
 func TestIsNetErrno_RejectsGenericErrno(t *testing.T) {
 	if isNetErrno(syscall.EINVAL) {

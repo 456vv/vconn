@@ -16,7 +16,11 @@ import (
 // 「这条连接现在适不适合复用」，不是「连接已经死了」。
 
 var (
-	// ErrNotReusable CheckReusable 返回的所有错误都满足 errors.Is(err, ErrNotReusable)。
+	// ErrNotReusable 是 CheckReusable 失败错误的公共伞。
+	//
+	// 具体原因（io.EOF、ErrConnDirty、ErrBusy 等）通过 Unwrap 一起暴露，
+	// 所以 errors.Is(err, ErrNotReusable) 与 errors.Is(err, 具体原因) 可以同时成立。
+	// 裸用本错误（不经 CheckReusable 包装）没有具体原因，StatusOf 会归为 StatusUnknown。
 	ErrNotReusable = errors.New("vconn: connection is not reusable")
 
 	// ErrConnDirty 连接存活，但存在未读数据（协议失步 / 残留响应）。
@@ -74,12 +78,16 @@ func notReusable(reason error) error { return notReusableError{reason: reason} }
 //		return err // 换一条连接重试
 //	}
 //
+// 判定顺序是故意从便宜到贵：本地关闭、前台占用、遗留错误、已落定通知、
+// 读取配额，最后才做一次探测。前面任何一步失败都不再碰 socket。
+//
 // 约束（务必遵守，否则判定会失真）：
-//   - 只能在空闲连接上调用：需要「没有其它 goroutine 正在 Read/Write」；
-//   - 不关闭连接
+//   - 只能在空闲连接上调用：需要「没有其它 goroutine 正在 Read/Write」。
+//     前台正持有读锁时返回 StatusBusy，而不是猜测连接死活；
+//   - 不关闭连接，也不修改调用方的 ReadDeadline；
 //   - 有 fd 时零消耗（SO_ERROR + poll + MSG_PEEK），无 fd 时可能读 1 字节进预读缓冲
-//     （探测额度见 SetBackgroundReadBuffer；显式设为负值时不探测，返回 ErrUnverified）；
-//   - 不适用于 server-speaks-first / 推送型协议（它们天然有未读数据 → 恒判脏）；
+//     （探测额度见 SetBackgroundReadBuffer；显式设为 0 或负值时不探测，返回 ErrUnverified）；
+//   - 不适用于 server-speaks-first / 推送型协议（它们天然有未读数据，恒判 StatusDataPending）；
 //   - 池里的连接不要开 SetBackgroundReadBuffer(>0)，预读字节会被判脏；
 //   - 用 NewData 交接进来的字节同样会被判脏；
 //   - TLS 内部缓冲不可见，只能尽力而为；业务仍需支持换连接重试。

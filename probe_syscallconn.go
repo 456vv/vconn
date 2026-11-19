@@ -7,6 +7,9 @@ import "syscall"
 // SyscallConn 转发底层 syscall.Conn，避免 WrapSafeBlockProbe 把
 // *net.TCPConn 等本来可做内核探测的连接降级为阻塞预读。
 //
+// 不转发的话，包装后的连接只剩 SafeBlockProber，内核探测会把它当成普通叶子连接；
+// 对 TCP 来说那既慢，也会在不必要时读走 1 字节。转发后探测仍能拿到原始 fd。
+//
 // 底层不是 syscall.Conn（如 net.Pipe）时返回 ErrUnsupported；
 // 调用方（probeConn）会把它归类为 probeUnsupported，再按叶子连接规则处理。
 func (c safeBlockConn) SyscallConn() (syscall.RawConn, error) {

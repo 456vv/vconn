@@ -9,12 +9,17 @@ import (
 //
 // 每轮监控的生命周期由自己的 quit/done 承载，因此可以在
 // 「通知已落定 → ResetNotify 重置」之后开启新一轮监控，
-// 而不需要重建 Conn。（旧实现用 close 一次的 channel 表达停止信号，
-// 监控只能是"一次性"的。）
+// 而不需要重建 Conn。（若用「close 一次的 channel」表达停止信号，
+// 监控就只能是一次性的，无法分轮。）
 //
 // 本实例的 quit 会显式传递给 peekStep/peekRead：
 // 预读路径用它判断「我这一轮是否已被要求退出」，而不是到 c.mon 去反查。
 // 反查在换代瞬间会认错实例，让旧监控的阻塞预读不受约束。
+//
+// 三个 channel 的分工：
+//   - quit：退出信号（本轮停止的唯一凭据，由 stop 幂等关闭）；
+//   - wake：唤醒信号（请求按最新周期重置 timer，容量 1，重复请求自动合并）；
+//   - done：收尾信号（监控协程真正退出后关闭，stopMonitor 据此判断是否退出成功）。
 
 type monitorRun struct {
 	quit     chan struct{}
@@ -145,7 +150,12 @@ func (c *Conn) stopMonitor() bool {
 	return exited
 }
 
-// monitorLoop 常驻监控协程：每轮一个实例，空闲时按周期探测
+// monitorLoop 常驻监控协程：每轮一个实例，空闲时按周期探测。
+//
+// 首轮立即执行，是为了「订阅之后马上知道已经死了的连接」，不用空等一个周期。
+// 首轮只有在这条连接还没有任何成功的内核读取时才允许阻塞预读：
+// readSeq > 0 说明前台刚刚读过，再阻塞读既可能抢数据，也会把 ReadDeadline 临时改掉。
+// 之后每一轮用 readSeq 判断空闲。序号没变才探测；序号变了说明前台 Read 自己会看到 EOF。
 func (c *Conn) monitorLoop(m *monitorRun) {
 	// 先清掉实例指针，再通知 done：让 stopMonitor 的等待者看到一致状态，
 	// 也避免「监控已自行退出但 c.mon 仍指向死实例」导致无法再开新一轮。
@@ -203,8 +213,11 @@ func resetTimer(timer *time.Timer, d time.Duration) {
 // m 为本轮监控实例：它会被透传给 peekStep，供阻塞预读在发起前做
 // 「本实例是否已被要求退出」的拒绝迟到检查（不能用 c.mon 反查）。
 //
-// allowBlock 仅在首轮为 true：允许做一次等待型探测。
+// allowBlock 仅在首轮、且连接尚未发生过成功读取时为 true：允许做一次等待型探测。
 // idle 表示上一周期内没有发生前台读取。
+//
+// 结束条件只有三类：本地已关闭、通知已经落定、本轮探测确认对端结束。
+// 预读缓冲满、前台正在读、内核不支持探测，都只是本轮跳过，监控继续按周期运行。
 func (c *Conn) monitorPass(m *monitorRun, allowBlock, idle bool) bool {
 	if c.closed.Load() || c.isNotified() {
 		return true
@@ -248,8 +261,9 @@ func (c *Conn) monitorPass(m *monitorRun, allowBlock, idle bool) bool {
 
 // isNotified 读取"关闭通知是否已落定"。
 //
-// 无锁：notifiedA 是 c.mu 保护下的 notified 的镜像（写侧在 c.mu 内成对更新）。
-// 探测热路径每周期都会调用本方法，避免为此反复抢 c.mu。
+// 无锁：c.notified 是 c.mu 保护下的 notified 字段的无锁镜像
+// （写侧在 c.mu 内成对更新）。探测热路径每周期都会调用本方法，
+// 避免为此反复抢 c.mu。
 func (c *Conn) isNotified() bool {
 	return c.notified.Load()
 }

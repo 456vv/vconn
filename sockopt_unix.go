@@ -14,7 +14,7 @@ import (
 //   - 无待处理错误 → nil（连接正常）；
 //   - 拿不到 fd / 读不到该选项（非 socket、fd 已失效等）→ ErrUnsupported，
 //     由调用方回退到 probeConn。**不能**把「探测失败」当成「连接已断开」，
-//     否则 CheckAlive 会对健康连接误报（旧版就踩过这个坑）。
+//     否则 Check/CheckBlocking 会对健康连接误报。
 func socketError(c net.Conn) error {
 	sc, ok := syscallConnOf(c)
 	if !ok {

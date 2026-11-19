@@ -8,8 +8,15 @@ import (
 	"syscall"
 )
 
-// isCommonNetError 精准识别由于远程断开或系统网络中断引起的非正常关闭错误
-// 该函数是线程安全的，可以并发调用
+// isCommonNetError 判断错误是不是「连接已经不可用」而不是普通控制流。
+//
+// 命中范围：io.EOF、net.ErrClosed、io.ErrUnexpectedEOF，以及各平台白名单里的
+// 断开 errno（ECONNRESET、EPIPE、网络不可达等）。读写超时一律不算：
+// 超时是调用方自己的 deadline，连接可能仍然健康。
+//
+// Read/Write 用它决定要不要分发远端关闭通知；StatusOf 用同一份白名单把
+// 这些 errno 归到 StatusPeerReset。两处必须共用，否则「通知说断了」和
+// 「分类说未知」会漂移。本函数不分配、不修改错误，可并发调用。
 func isCommonNetError(err error) bool {
 	if err == nil {
 		return false

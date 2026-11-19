@@ -7,6 +7,10 @@ import "errors"
 //	低 4 位（Class）：类别，即「发生了什么」（观测）/「该怎么处置」（错误）
 //	第 4 位（Unread）：修饰标志，即「是否还有未读数据」
 //
+// 位域这样切是为了让 switch 只看类别：StatusPeerClosedWithUnread 与
+// StatusPeerClosed 的 Class() 相同，调用方不会因为「还有数据」漏进 default。
+// 类别超过 15 个会和 Unread 位重叠，state.go 底部的编译期除法会直接编译失败。
+//
 //	st, err := c.CheckReusable()
 //	if st == vconn.StatusAlive {
 //		reuse()                       // 干净存活，可以交给下一个使用者

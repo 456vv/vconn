@@ -51,7 +51,10 @@ func (s Status) Terminal() bool {
 //
 // 注意：内部类型必须实现它——这是 StatusOf 无需猜测错误语义的前提。
 // 新加的错误类型如果没有实现 Statuser，只能在 StatusOf 的 switch 里登记，
-// 否则分类会静默落到 StatusUnknown（kind_state_test.go 的黄金表会盯着）。
+// 否则分类会静默落到 StatusUnknown（status_test.go 的黄金表会盯着）。
+//
+// 实现时只回答「这个错误属于哪一类」，不要在 Status() 里做 I/O、探测或修改连接。
+// StatusOf 可能在日志、指标和每次 Read 错误路径上被调用，必须是纯函数。
 type Statuser interface {
 	Status() Status
 }
@@ -65,7 +68,7 @@ type Statuser interface {
 // 为什么不用字符串匹配：错误串是给日志看的，一旦有人改了文案，
 // 分类就会静默失效；errors.Is/As + Status 是结构化契约。
 //
-// # 映射表（权威版本是 kind_state_test.go 里的黄金表）
+// # 映射表（权威版本是 status_test.go 里的黄金表）
 //
 //	StatusAlive        nil
 //	StatusPeerClosed   io.EOF / ErrPeerClosedWithUnread / peerClosedWithUnreadError{} /
@@ -82,7 +85,7 @@ type Statuser interface {
 //	StatusUnsupported  ErrUnsupported
 //	StatusUnknown      ErrNotReusable 裸用 / 自定义错误
 //
-// 与 Check* 的关系（kind_state_test.go 里的不变量测试）：
+// 与 Check* 的关系（status_test.go 里的不变量测试）：
 // err 非 nil 时 StatusOf(err).Class() 应与 Check* 返回的类别相同；
 // 唯一例外是「对端确实结束了，但原因无法归类」——那时 Check* 保守报
 // StatusPeerReset，而 StatusOf 如实报 StatusUnknown。

@@ -10,7 +10,9 @@ import (
 
 // socketError 返回内核 socket 上待处理的错误（SO_ERROR），无错误时返回 nil
 //
-// 注意：旧版本误用 SO_KEEPALIVE 判断连接状态，导致该检查恒为 nil。
+// 注意：SO_ERROR 才是「内核待处理的连接错误」的正确选项。
+// 不能用 SO_KEEPALIVE 之类的其它选项代替——那会得到一个恒定的无关值，
+// 导致本检查永远返回 nil（连接已断开却探测不出来）。
 func socketError(c net.Conn) error {
 	sc, ok := syscallConnOf(c)
 	if !ok {

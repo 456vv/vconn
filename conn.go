@@ -1,29 +1,48 @@
-// Package vconn 提供带「连接关闭提前通知」能力的 net.Conn 包装。
+// Package vconn 为任意 net.Conn 提供「连接关闭提前通知」与「连接状态判定」能力。
 //
-// 设计要点（审计与修复说明见 docs/audit-report-2026-11-15.md）：
+// # 它解决什么问题
 //
-//   - 监控：每个连接至多一个常驻协程，使用内核级、零字节消耗的探测
+// 标准 net.Conn 只能通过 Read 返回 io.EOF 才知道对端已经关闭，这带来三个麻烦：
+//
+//   - 对端「先发数据再 FIN」时，调用方必须把接收缓冲读空才知道连接已经结束，
+//     这段时间里无法区分「还在等下一段数据」与「对方已经走了」；
+//   - 纯写入场景（上传、推送、请求已发出等响应）永远等不到 EOF，
+//     只能靠超时或业务心跳兜底；
+//   - 连接池回收时无法安全判断「这条连接还干净吗」。
+//
+// vconn 在底层 socket 上做零字节消耗的内核级探测，对端一断开就能立刻通知，
+// 并且明确区分「干净结束」「异常重置」「还有未读数据」三种状态。
+//
+// # 核心设计
+//
+//   - 监控：每条连接至多一个常驻协程，用内核级、零字节消耗的探测
 //     （unix: poll(2) + recv(MSG_PEEK) / windows: WSAPoll + FIONREAD）
-//     判断对端是否关闭；不再"每次 Read 起一个后台协程"，也不再篡改调用方的 ReadDeadline。
+//     判断对端是否关闭；不做「每次 Read 起一个后台协程」，也不篡改调用方设置的
+//     ReadDeadline。
 //   - 预读：仅在连接空闲且无人读取时进行，且使用自己的超时；
-//     兼容 SetBackgroundReadBuffer 的旧语义（>0 预读、<0 丢弃、=0 关闭）。
-//   - 并发：前台读由 Conn.fg 串行化，多个 goroutine 并发 Read 不会互相注入伪超时。
+//     SetBackgroundReadBuffer 的语义是 n>0 预读、n<0 丢弃、n=0 关闭。
+//   - 并发：前台读由 Conn.r.fg 串行化，多个 goroutine 并发 Read
+//     不会互相注入伪超时。
 //   - 关闭：先关闭底层 fd（立即解除阻塞），再分发通知，永不无限等待。
 //
 // 所有公开方法均并发安全。
 //
-// 状态与错误分类（v3，详见 docs/v2-probe-api.md 与 state.go / kind.go）：
+// # 状态与错误分类
 //
-//   - Status 是唯一的「连接结论」类型，一个字节同时表达「类别」与「是否还有未读数据」。
-//     探测与错误共用同一套常量，调用方只需要学一个枚举：
-//     Check / CheckBlocking 返回 (Status, error)，CheckReusable 直接给出池化判定，
+// Status 是唯一的「连接结论」类型，一个字节同时表达「类别」与「是否还有未读数据」。
+// 探测与错误共用同一套常量，调用方只需要学一个枚举：
+//
+//   - Check / CheckBlocking 返回 (Status, error)，CheckReusable 直接给出池化判定，
 //     Snapshot() 给出不探测的纯快照（永不会宣称「存活」），
 //     StatusOf(err) 把任意错误归到同一个 Status（Read / Write / CloseNotify / Check*
 //     的错误空间共用同一套答案，一个 switch 就够）。
 //   - 观测轴与处置轴共用类型但问题不同：Readable / Reusable / Ended 讲「连接怎么样」，
 //     Retryable / Terminal 讲「我该怎么做」。
 //
-// 内部不变量（实现约束，修改实现时必须保持）：
+// 类型与常量的定义在 state.go，「错误 → Status」的映射在 kind.go。
+//
+// # 内部不变量（实现约束，修改实现时必须保持）
+//
 //  1. 任何一次可能阻塞的后台 socket 读，都必须先置位 peekBusy 再写自身 deadline，
 //     二者同在 deadlineMu 内完成 —— stopMonitor 的「过去时间 deadline」不会被覆盖；
 //  2. 监控实例身份随调用链显式传递（peekStep(stop)），禁止用 c.mon 反查「我是否该退出」；
@@ -50,7 +69,10 @@ import (
 	"time"
 )
 
-// CloseNotifier 提供连接关闭通知能力
+// CloseNotifier 提供连接关闭通知能力。
+//
+// 任何实现了 CloseNotify() <-chan error 的类型都可以被本包的辅助逻辑
+// 当作「可订阅关闭通知的连接」使用；*Conn 天然满足该接口。
 type CloseNotifier interface {
 	CloseNotify() <-chan error
 }
@@ -63,7 +85,7 @@ var (
 	// 写方向是最常见的正常收尾方式，收到本错误同样意味着「数据可读」。
 	//
 	// 与 io.EOF 的关系：携带本哨兵的错误同时满足 errors.Is(err, io.EOF)，
-	// 因此只判 EOF 的老代码行为完全不变；需要区分时追加一个判定：
+	// 因此只判 EOF 的代码行为完全不变；需要区分时追加一个判定：
 	//
 	//	switch err := <-c.CloseNotify(); {
 	//	case errors.Is(err, vconn.ErrPeerClosedWithUnread):
@@ -71,26 +93,58 @@ var (
 	//	case errors.Is(err, io.EOF):
 	//		// 队列已读空的干净结束 → 可直接 Close
 	//	}
+	//
+	// 对应的状态类别：StatusPeerClosed（带 unread 修饰时为 StatusPeerClosedWithUnread）。
 	ErrPeerClosedWithUnread = errors.New("vconn: peer closed with unread data")
 
-	// ErrRawConnAlreadyUsed 表示原始连接已被提取，当前包装连接失效
+	// ErrRawConnAlreadyUsed 表示原始连接已被提取，当前包装连接失效。
+	//
+	// 触发场景：
+	//   - 重复调用 RawConn / RawConnFull（这会 panic，不是返回本错误）；
+	//   - RawConn 提取所有权后，原包装连接的分发通知以本错误作为关闭原因。
+	//
+	// 对应的状态类别：StatusMisuse。
 	ErrRawConnAlreadyUsed = errors.New("vconn: the original connection has already been extracted and cannot be used")
 
-	// ErrNotifyCanceled CancelNotify(nil) 时写入关闭理由的哨兵错误
+	// ErrNotifyCanceled CancelNotify(nil) 时写入关闭理由的哨兵错误。
+	//
+	// CancelNotify 传入 nil 时用它兜底，避免把「收到 nil 错误」这种不确定语义
+	// 交给订阅者。也用于 WithContext 取消时规整自定义 Context 违反契约的情况。
+	//
+	// 对应的状态类别：StatusLatched（表示「这一轮等待被撤销」，连接本身未必坏）。
 	ErrNotifyCanceled = errors.New("vconn: close notification canceled by CancelNotify")
 
-	// ErrUnsupported 平台或底层连接不支持该操作
+	// ErrUnsupported 平台或底层连接不支持该操作。
+	//
+	// 例如对 net.Pipe 调用 SetKeepAlive / SetLinger / CloseWrite 等可选方法，
+	// 或在拿不到 fd 的连接上做内核级探测。
+	//
+	// 对应的状态类别：StatusUnsupported。
 	ErrUnsupported = errors.New("vconn: operation not supported")
 
-	// ErrResetLocallyClosed 连接已被本地关闭（Close / RawConn），不可重置通知状态
+	// ErrResetLocallyClosed 连接已被本地关闭（Close / RawConn），不可重置通知状态。
+	//
+	// 这是 ResetNotify 不可逾越的边界：底层连接已经不可用，重新武装没有意义。
+	//
+	// 对应的状态类别：StatusLocalClosed。
 	ErrResetLocallyClosed = errors.New("vconn: cannot reset close notification on a locally closed connection")
 
 	// ErrResetPeerDown 已探测到对端断开（或正常/异常结束），默认不允许重置通知状态；
-	// 确认要重新武装请使用 ResetNotify(true)
+	// 确认要重新武装请使用 ResetNotify(true)。
+	//
+	// 之所以要确认：连接池回收路径上，「对端下线」往往正是应该丢弃这条连接的理由，
+	// 无脑重置会让一条已死的连接重新进入池子。
+	//
+	// 对应的状态类别：StatusPeerClosed（真实状态是对端结束，只是这一轮不能重新武装）。
 	ErrResetPeerDown = errors.New("vconn: cannot reset close notification after peer was detected down")
 
 	// ErrResetTimeout 上一轮监控协程未能在时限内退出，重置未完成；
-	// 状态已清空，可直接重试 ResetNotify（不会重复启动监控）
+	// 状态已清空，可直接重试 ResetNotify（不会重复启动监控）。
+	//
+	// 出现原因：上一轮监控正卡在阻塞式预读里，没能在 monitorStopTimeout 内退出。
+	// 这属于「忙」而非「坏」，稍后重试即可。
+	//
+	// 对应的状态类别：StatusBusy。
 	ErrResetTimeout = errors.New("vconn: previous monitor goroutine did not exit in time")
 )
 
@@ -100,12 +154,21 @@ const (
 	defaultMonitorInterval = 200 * time.Millisecond
 	// minMonitorInterval 允许的最小探测周期
 	minMonitorInterval = 10 * time.Millisecond
-	// peekReadTimeout 监控协程（peekStep）阻塞预读的自身超时上限。
-	// 后台路径，宁可略长也不要空转：10ms 与实际探测周期匹配，开销可忽略。
-	peekReadTimeout = 10 * time.Millisecond
-	// peekTimeout CheckBlocking（peekProbeStrict）阻塞预读的自身超时。
-	// 同步路径，调用方在等；但受系统 timer 精度限制，不建议低于 1ms（见下）。
+	// peekTimeout 后台/同步阻塞预读统一使用的自身超时。
+	//
+	// 两条调用路径共用同一个值：
+	//   - 监控协程的 peekStep（后台预读 / 丢弃）；
+	//   - CheckBlocking / CheckReusable 的 peekProbeStrict（同步探测）。
+	//
+	// 取 2ms 的理由：这是「等一小会儿看有没有数据」的等待窗口，不是业务超时。
+	// 后台路径每轮至多浪费 2ms（相对默认 200ms 的探测周期可忽略）；
+	// 同步路径调用方本来就在等，2ms 的感知延迟也远低于人眼可辨范围。
+	// 注意：受系统 timer 精度限制，低于 1ms 没有实际意义。
 	peekTimeout = 2 * time.Millisecond
+	// peekReadTimeout peekRead 的兜底超时：仅当调用方传入 timeout<=0 时使用。
+	// 正常路径上（peekStep / peekProbeStrict）都会显式传 peekTimeout，
+	// 因此该常量只在防御性场景生效。
+	peekReadTimeout = 10 * time.Millisecond
 	// monitorStopTimeout 等待监控协程退出的上限，绝不无限等待
 	monitorStopTimeout = time.Second
 	// minPeekBuf 预读/丢弃临时缓冲的最小长度：
@@ -126,7 +189,10 @@ const (
 	defaultPeekSize = minPeekBuf
 )
 
-// closeSignal 单个关闭通知订阅者
+// closeSignal 单个关闭通知订阅者。
+//
+// 每个订阅者一个实例，由 Conn.signals 集合持有。
+// ch 容量为 1：通知最多投递一次，且即便调用方来不及接收也不会阻塞分发方。
 type closeSignal struct {
 	ch   chan error
 	once sync.Once
@@ -144,9 +210,14 @@ const (
 	kindManual
 )
 
+// newCloseSignal 创建一个订阅者实例（ch 缓冲 1，尚未投递任何错误）
 func newCloseSignal() *closeSignal { return &closeSignal{ch: make(chan error, 1)} }
 
 // fire 发送错误并关闭 channel，仅生效一次
+//
+// 用 once 保证「投递 + 关闭」整体只发生一次：
+// 多次触发（例如监控与 Close 同时落定）时，订阅者只会收到第一个原因，
+// 不会出现「往已关闭的 channel 发送」而 panic。
 func (s *closeSignal) fire(err error) {
 	s.once.Do(func() {
 		select {
@@ -158,15 +229,36 @@ func (s *closeSignal) fire(err error) {
 }
 
 // discard 仅关闭 channel（退订时使用）
+//
+// 不投递任何错误：退订意味着「我不关心结果」，关闭 channel 即可让等待方退出。
 func (s *closeSignal) discard() {
 	s.once.Do(func() { close(s.ch) })
 }
 
-// Conn 封装了标准的 net.Conn，具备异步断开监控、限流及防死锁提取功能
-// 所有公开方法均为并发安全
+// Conn 封装了标准的 net.Conn，额外提供：
+//
+//   - 异步断开监控（CloseNotify / WatchClose）；
+//   - 连接状态判定（Check / CheckBlocking / CheckReusable / Snapshot）；
+//   - 读取限流（SetReadLimit）与后台预读（SetBackgroundReadBuffer）；
+//   - 所有权转移（RawConn / RawConnFull），用于把连接交还调用方或交给连接池。
+//
+// # 并发约定
+//
+// 所有公开方法均并发安全。内部有两把锁值得知道：
+//
+//   - mu：保护关闭状态机（订阅者集合、closeErr、peerDown、关闭返回值）；
+//   - r.fg：串行化所有前台读，因此多个 goroutine 并发 Read 不会互相
+//     注入伪超时，也不会打乱预读字节的交付顺序。
+//
+// # 生命周期
+//
+// 正常用法是「New → 使用 → Close」。Close 会先关闭底层 fd（立即解除所有阻塞中的
+// Read/Write），再分发关闭通知。调用 Close 之后，本连接不可再用于读写，
+// 但 LocalAddr / RemoteAddr / Err / Snapshot 等只读方法依然可用。
 type Conn struct {
 	rwc net.Conn // 底层真实连接（构造后不可变）
 
+	// —— 关闭状态机（由 mu 保护）——
 	mu        sync.Mutex
 	signals   map[*closeSignal]struct{} // 关闭通知订阅者
 	closeErr  error                     // 首次关闭原因
@@ -184,9 +276,10 @@ type Conn struct {
 	readDeadline time.Time  // 类型化快照（零值可用，无 atomic.Value 类型断言风险）
 	deadlineMu   sync.Mutex // 串行化底层 deadline 的写入（set/restore）
 
+	// —— 热路径无锁标志 ——
 	closed  atomic.Bool // 关闭快速路径标志
 	rawUsed atomic.Bool // 原始连接是否已被提取
-	// notified notified 的无锁镜像，供探测热路径（isNotified）使用；
+	// notified 是 mu 保护下 notified 字段的无锁镜像，供探测热路径（isNotified）使用；
 	// 写侧仍必须在 c.mu 内先更新 notified，再更新本镜像。
 	notified    atomic.Bool   // 是否已分发过关闭通知（可被 ResetNotify 撤销）
 	peekSize    atomic.Int64  // 后台预读/丢弃字节数：=0 关闭，>0 预读，<0 丢弃
@@ -198,8 +291,59 @@ type Conn struct {
 	mon   atomic.Pointer[monitorRun] // 当前监控实例（nil 表示未运行）
 }
 
-// New 包装原始连接。若已被包装，则直接返回本身。
+// ==================== 锁与状态的分工总览 ====================
+//
+// 本包有四把锁，职责严格分离，阅读代码前先记住这张表：
+//
+//	c.mu         关闭状态机：signals / closeErr / peerDown / closeRet / closeDone
+//	c.deadlineMu 底层 socket 的 deadline 写入（设置、临时改写、恢复）
+//	c.r.fg       前台读串行化（所有 Read + 后台预读共用）
+//	c.r.peekMu   预读缓冲区的读写
+//
+// 锁序约束（改动时必须保持）：
+//
+//	c.mu → c.r.peekMu    （Snapshot 会这样嵌套）
+//	c.deadlineMu 不与 c.mu / c.r.peekMu 嵌套（它只包住 deadline 的写入）
+//	c.r.fg 不与 c.mu 嵌套（后台预读持 fg 时绝不抢 c.mu）
+//
+// 特别注意 c.r.fg 与 c.deadlineMu 的配合：
+// 「设置后台读的超时」必须在 deadlineMu 内完成，且必须先置位 peekBusy，
+// 否则 stopMonitor 的「过去时间 deadline」会与后台读自己的 deadline 相互覆盖，
+// 后台读可能永远阻塞（见 conn_reader.go 的 peekRead 不变量）。
+//
+// ==================== 监控协程的生命周期 ====================
+//
+// 监控是「惰性启动、按需分轮」的：
+//
+//	启动：第一次调用 CloseNotify / WatchClose 时（startMonitor）
+//	停止：通知落定（notifyClose）、Close、RawConn、ResetNotify 换代时
+//	分轮：每次 ResetNotify 成功后开启新一轮（新的 monitorRun 实例）
+//
+// 整条连接在任意时刻至多有一个「存活」的监控实例；
+// 换代期间新旧实例可能短暂共存，但预读由 fg 锁串行化，不会同时读同一个 socket。
+
+// New 包装原始连接，使其具备关闭提前通知与状态判定能力。
+//
+// 若 c 已经是 *Conn，则直接返回它自身（幂等，不会重复包装）。
 // 参数 c 不能为 nil，否则会 panic。
+//
+// 典型用法：
+//
+//	raw, err := net.Dial("tcp", "127.0.0.1:8080")
+//	if err != nil {
+//		return err
+//	}
+//	c := vconn.New(raw)
+//	defer c.Close()
+//
+//	go func() {
+//		if err := <-c.CloseNotify(); err != nil {
+//			log.Printf("连接已断开: %v", err)
+//		}
+//	}()
+//
+// 注意：New 本身不会启动监控协程。第一次调用 CloseNotify / WatchClose
+// 才会惰性启动监控——没人关心关闭事件时，不值得为它付出系统调用。
 func New(c net.Conn) *Conn {
 	return NewData(c, nil)
 }
@@ -207,7 +351,10 @@ func New(c net.Conn) *Conn {
 // NewData 包装原始连接，并把 b 作为「已到达的预读数据」放入读取缓冲区
 // （调用方的 Read 会优先返回这些字节）。
 //
-// 若 c 已经是 *Conn，则把 b 追加到既有预读缓冲区后返回 c 本身。
+// 典型用途：把「从别处读到的、属于这条连接的数据」交接进来，例如连接池
+// 把某个连接的响应字节转交给新持有者，或 TLS 握手后从底层读出的剩余明文。
+//
+// 若 c 已经是 *Conn，则把 b 追加到既有预读缓冲区后返回 c 本身（幂等）。
 // 参数 c 不能为 nil，否则会 panic。
 //
 // 注意：对本包返回的 *Conn 并发调用 NewData 是安全的（内部用 peekMu 串行化），
@@ -298,10 +445,25 @@ func snapshotAddr(a net.Addr) net.Addr {
 }
 
 // ==================== 原始连接提取 ====================
+//
+// 提取原始连接 = 把连接的「所有权」交还调用方。语义要点：
+//
+//   - 提取之后，本 Conn 不再拥有底层 fd：Close 不再关闭它；
+//   - 提取之后，本 Conn 的读写路径全部失效（Read/Write 返回 net.ErrClosed）；
+//   - 提取只能发生一次：重复调用 panic（ErrRawConnAlreadyUsed）；
+//   - 提取时会分发一次 kindLocal 通知，原因是 ErrRawConnAlreadyUsed，
+//     告诉订阅者「连接已经不属于 vconn 了」。
 
 // RawConn 剥离包装，归还底层真实连接
+//
 // 剥离后，此 Conn 无法再读写，任何操作将返回 net.ErrClosed
-// 该方法只能调用一次，重复调用会 panic
+// 该方法只能调用一次，重复调用会 panic（ErrRawConnAlreadyUsed）
+//
+// 与 Close 的区别：Close 会关闭底层连接；RawConn 只「解除所有权」，
+// 底层连接仍然打开，调用方拿到后可以继续使用（这也是它不关闭底层的原因）。
+//
+// 若与 Close 并发调用：本方法会等待首个 Close 收尾后再返回，
+// 确保不会与 Close 同时操作同一个 fd。
 func (c *Conn) RawConn() net.Conn {
 	c.mu.Lock()
 	if c.rawUsed.Load() {
@@ -329,6 +491,9 @@ func (c *Conn) RawConn() net.Conn {
 }
 
 // finishLocalClose 完成本地关闭的收尾：停监控、分发本地通知。
+//
+// 顺序很重要：先停监控（探测协程不得再访问 fd），再分发通知
+// （订阅者收到通知时，连接已经彻底不可用了）。
 func (c *Conn) finishLocalClose() {
 	c.stopMonitor()
 	c.notifyClose(ErrRawConnAlreadyUsed, kindLocal)
@@ -341,6 +506,9 @@ func (c *Conn) finishLocalClose() {
 // 取得前台读锁（fg）后恢复调用方设置的最新 deadline，取走预读数据并在仍持有 fg
 // 时完成 RawConn 的所有权转移。这样不会出现「预读仍在写已放弃缓冲区」的丢数据
 // 竞态，也不会出现「RawConn 已返回、探测协程仍继续操作同一 fd」的 TOCTOU。
+//
+// 与 RawConn 的差别：RawConn 会丢弃预读缓冲区里的字节（数据丢失），
+// RawConnFull 会把它们一并交回，**零丢失**。连接池回收请务必用 RawConnFull。
 //
 // 注意：若调用本方法时有其它 goroutine 正阻塞在 Read 上，该 Read 会被临时 deadline
 // 唤醒并返回一个超时错误；取得 fg 后会恢复调用方设置的 deadline。因此调用方应把
@@ -372,6 +540,15 @@ func (c *Conn) RawConnFull() (net.Conn, []byte) {
 }
 
 // ==================== 配置 ====================
+//
+// 配置项分三类，语义互不重叠：
+//
+//	连接级（作用于整条连接）：SetMonitorInterval
+//	数据面（影响 Read 的行为）：SetBackgroundReadBuffer / SetReadLimit
+//	套接字级（透传给内核）：SetReadBuffer / SetKeepAlive / SetLinger / ...
+//
+// 配置项都可以并发修改：内部要么走原子变量，要么走独立的锁，
+// 不会与读写路径争用同一把锁。
 
 // SetBackgroundReadBuffer 设置后台预读字节数
 //
@@ -390,6 +567,10 @@ func (c *Conn) RawConnFull() (net.Conn, []byte) {
 //
 // 调用本方法后，CheckBlocking / CheckReusable 不再隐式武装预读（完全尊重用户设置，
 // 包括显式设为 0 关闭）。
+//
+// 内存占用提示：预读缓冲（peek）与临时缓冲（peekTmp）都随连接常驻。
+// 丢弃模式（n < 0）下 |n| 直接决定 peekTmp 的长度；当之后不再需要大缓冲时，
+// vconn 会在需求变小且旧缓冲超过 64 KiB 时主动释放（见 tmpBuf）。
 func (c *Conn) SetBackgroundReadBuffer(n int) {
 	if n > maxPeekSize {
 		n = maxPeekSize
@@ -407,12 +588,29 @@ func (c *Conn) SetBackgroundReadBuffer(n int) {
 // （它用 %w 包住 io.EOF，按 io.EOF 判定与比较的语义不变；
 // 想区分「配额用尽」与「对端关闭」请用 errors.Is(err, ErrQuotaExhausted)
 // 或 StatusOf(err) == StatusQuota）。配额耗尽不会触发关闭通知。
+//
+// 语义：这是一个「读多少字节」的闸门，不是「连接最多存活多久」。
+// 配额按**实际交付给调用方的字节数**扣减（包含从预读缓冲区取走的部分），
+// 并发调用下用 CAS 扣减，不会超发。
+//
+// 配额耗尽后：Read 立即返回 ErrQuotaExhausted（不再触碰 socket），
+// 且**不会**落定 peerDown —— 因为对端并没有断开。
+// 需要恢复读能力请重新调用 SetReadLimit。
 func (c *Conn) SetReadLimit(remain int64) {
 	c.r.setReadLimit(remain)
 }
 
 // SetMonitorInterval 设置空闲连接的关闭探测周期，默认 200ms
 // d <= 0 时恢复默认值
+//
+// 语义：这是「空闲连接多久探测一次」的节流阀，不是探测超时。
+// 探测本身是非阻塞的（一次 poll/WSAPoll + MSG_PEEK），不会挂起任何 goroutine。
+//
+// 调小的代价：CPU 与系统调用次数上升（每条空闲连接每个周期一次探测）；
+// 调大的代价：对端断开后，通知延迟变大（上限约等于该周期）。
+//
+// 生效方式：立即唤醒当前监控协程按新周期重置定时器，无需重启连接。
+// 探测周期下限为 10ms（低于此值没有实际意义）。
 func (c *Conn) SetMonitorInterval(d time.Duration) {
 	if d <= 0 {
 		d = defaultMonitorInterval
@@ -425,6 +623,27 @@ func (c *Conn) SetMonitorInterval(d time.Duration) {
 }
 
 // ==================== 关闭通知 ====================
+//
+// 关闭通知是一个「一次性事件」模型：
+//
+//	未落定 → 订阅者等待 → 某个原因落定 → 所有订阅者被唤醒 → channel 关闭
+//
+// 落定后 notified 被锁存，之后所有新订阅都会立即拿到同一个结果（不会重新探测）。
+// 需要在同一条连接上「多轮订阅」请用 ResetNotify 清除锁存。
+//
+// 订阅者集合在分发时被整体换走：先复制出本轮订阅者，再在锁外逐个投递。
+// 这样 fire 不会在持有 c.mu 时运行，订阅回调里再调用 Conn 方法也不会和分发死锁。
+//
+// 通知内容（channel 里收到的 error）按落定来源分为：
+//
+//	对端断开/网络异常：io.EOF（干净 FIN）、ECONNRESET 等（异常中断）、
+//	                  或 ErrPeerClosedWithUnread（对端已结束但还有未读数据）
+//	本地 Close：net.ErrClosed
+//	原始连接被提取：ErrRawConnAlreadyUsed
+//	手动取消：调用方传入的错误（nil 时用 ErrNotifyCanceled）
+//
+// 重要：通知只「告知」，不关闭底层连接。收到通知后是否 Close 由调用方决定
+// （若带 ErrPeerClosedWithUnread，应先 drain 再 Close，否则可能丢数据）。
 
 // CloseNotify 获取关闭通知 Channel
 // 支持多次调用；在对端意外断开或本地主动 Close 时均会触发通知
@@ -432,6 +651,9 @@ func (c *Conn) SetMonitorInterval(d time.Duration) {
 //
 // 注意：本方法不提供退订手段，订阅者会一直保留到连接关闭。
 // 需要退订请使用 WatchClose；需要「本次订阅没等到通知就想撤销」也请用 WatchClose。
+//
+// 副作用：第一次调用会启动监控协程（惰性启动）。没人关心关闭事件时，
+// New 本身不会付出任何系统调用成本。
 func (c *Conn) CloseNotify() <-chan error {
 	ch, _ := c.WatchClose()
 	return ch
@@ -446,6 +668,9 @@ func (c *Conn) CloseNotify() <-chan error {
 //     内容为当时的关闭原因；
 //   - 若希望"同一连接再次收到下一轮关闭通知"，先调用 ResetNotify 清除落定状态，
 //     再重新订阅：旧 channel 保持已关闭（不会被二次投递），新订阅进入新一轮。
+//
+// 退订函数是幂等的：多次调用安全无副作用。
+// 多个订阅者并存时，退订只删除自己的 closeSignal，不影响其它等待者。
 func (c *Conn) WatchClose() (<-chan error, func()) {
 	sig := newCloseSignal()
 
@@ -472,6 +697,8 @@ func (c *Conn) WatchClose() (<-chan error, func()) {
 		once.Do(func() {
 			c.mu.Lock()
 			if _, ok := c.signals[sig]; ok {
+				// 必须按订阅者指针删除。c.signals[sig] 的值是空结构体，
+				// 既不是 map 的 key，删它也会在多个订阅者并存时删错人。
 				delete(c.signals, sig)
 				c.mu.Unlock()
 				sig.discard()
@@ -565,8 +792,16 @@ func (c *Conn) ResetNotify(force bool) error {
 }
 
 // WithContext 将连接与上下文关联，在上下文取消时触发 CloseNotify 通知。
-// 本方法保持旧版语义：只通知，不关闭底层连接（阻塞中的 Read 不会被打断）。
-// 需要「取消即断开」请使用 WithContextClose。
+//
+// 语义：**只通知，不关闭底层连接**——阻塞中的 Read 不会被 ctx 取消打断，
+// 底层 socket 依然可用。需要「取消即断开」请使用 WithContextClose。
+//
+// 取消时写入通知的错误是 ctx.Err()（通常是 context.Canceled）；
+// 若自定义 Context 违反契约（Done 已关闭但 Err() 返回 nil），
+// 会用 ErrNotifyCanceled 兜底，避免把 nil 交给订阅者。
+//
+// 该通知属于「手动」类型：不会把连接标记为 peerDown（对端并没有断开），
+// 但会锁存通知状态（StatusLatched），需要 ResetNotify 才能重新武装。
 func (c *Conn) WithContext(ctx context.Context) {
 	if ctx == nil {
 		return
@@ -737,12 +972,18 @@ func (c *Conn) recordProbe(err error) error {
 
 // ==================== 读写 ====================
 
-// Read 从连接读取数据
-// 实现 io.Reader 接口，线程安全
+// Read 从连接读取数据，实现 io.Reader，并发安全。
 //
-// 注意：本方法不用 closedA 做短路。预读缓冲区里可能还存着已经到达的数据，
+// 交付顺序固定为：上次遗留的终止错误、读取配额、预读缓冲、底层 Read。
+// 已经从内核取出的字节一定先交给调用方；有数据时按 io.Reader 惯例返回
+// (n, nil)，终止错误留到下一次调用。
+//
+// 本方法不用 c.closed 做入口短路。预读缓冲区里可能还存着已经到达的数据，
 // 必须交由 connReader.Read 先交付；只有缓冲区为空且连接已关闭时才报
 // net.ErrClosed。关闭后的 Read 不是热路径，这点开销可以接受。
+//
+// 配额耗尽返回 ErrQuotaExhausted。它满足 io.EOF，但不是对端关闭，
+// 不会把连接标记为 peerDown，也不会分发关闭通知。
 func (c *Conn) Read(b []byte) (n int, err error) {
 	n, err = c.r.Read(b)
 	if n > 0 {
@@ -759,8 +1000,12 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 	return n, err
 }
 
-// Write 向连接写入数据
-// 实现 io.Writer 接口，线程安全
+// Write 向连接写入数据，实现 io.Writer，并发安全。
+//
+// 本地已关闭或原始连接已提取时直接返回 net.ErrClosed，不再触碰底层。
+// 底层返回网络断开类错误且本次没有写出任何字节时，会分发一次远端关闭通知；
+// 部分写入（n > 0）不在这里落定，避免把「写了一半」误报成连接已经结束。
+// 超时属于调用方的控制流，不会触发关闭通知。
 func (c *Conn) Write(b []byte) (n int, err error) {
 	if c.closed.Load() {
 		return 0, net.ErrClosed
@@ -786,11 +1031,15 @@ func (c *Conn) waitCloseDone(done chan struct{}) error {
 	return err
 }
 
-// Close 主动关闭连接，干净清理所有通知管道
-// 实现 io.Closer 接口，线程安全；重复调用返回首次关闭的错误
+// Close 主动关闭连接，实现 io.Closer，并发安全。
 //
-// 并发调用时，后到者会等待首个 Close 完成，从而拿到与之完全相同的结果
-// （不会出现"首个 Close 返回错误、并发的第二个 Close 返回 nil"）。
+// 顺序是：标记本地关闭、关闭底层 fd（立即解除阻塞中的读写）、记录首次返回值、
+// 停止监控、以 net.ErrClosed 分发 kindLocal 通知。通知不会把连接标成 peerDown，
+// 因为这是本地动作，不是对端断开。
+//
+// 重复调用返回首次关闭的错误。并发调用时，后到者会等待首个 Close 完成，
+// 从而拿到与之完全相同的结果（不会出现「首个返回错误、第二个返回 nil」）。
+// 原始连接已被 RawConn 提取时，本方法不再关闭底层 fd，只完成通知收尾。
 func (c *Conn) Close() error {
 	c.mu.Lock()
 	if c.closed.Load() {
@@ -1095,21 +1344,26 @@ func (c *Conn) Check() (Status, error) { return c.probe(false) }
 //   - 设置负值（丢弃模式）：探活不得吞数据，同样返回 StatusUnverified。
 //
 // 单次只读 1 字节，可高频重复调用；预读到的字节进入预读缓冲，前台 Read 优先消费。
-// 最坏等待 2ms；若前台正持有读锁（正在读），直接返回 StatusUnverified
-// ——前台读本身就是连接活着的证据。
+// 最坏等待 2ms。若前台正持有读锁，无法安全地再读，直接返回 StatusUnverified；
+// 这是「现在没法判定」，不是「连接已死」，也不是可复用证明。
+// 包装型连接（实现了 NetConn，且没有显式声明 SafeBlockProber）同样跳过阻塞读，
+// 避免提前 Read 破坏 TLS 记录或吞掉多路复用帧。
 func (c *Conn) CheckBlocking() (Status, error) { return c.probe(true) }
 
-// checkKernel 执行内核级健康检查，供 probe / CheckReusable 共用。
+// checkKernel 执行内核级健康检查，供 probe 共用。
+// CheckReusable 不直接调用它，而是走 probe(true)，从而在拿不到 fd 时还能退化为阻塞预读。
 //
 // 返回值：
 //   - (probeClosed, err):         已确认断开；err 为断开原因（干净 FIN 时为 io.EOF，异常时为具体错误）
 //   - (probeIdle, nil):           已确认存活且当前无数据
 //   - (probeReadable, nil):       已确认存活且有数据可读
-//   - (probeReadableHangup, err): 有未读数据且对端已 FIN；err 为 ErrPeerClosedWithUnread
-//     ErrPeerClosedWithUnread（Unwrap 到 io.EOF）。数据仍可读，按「存活」上报。
+//   - (probeReadableHangup, err): 有未读数据且对端已结束。err 是 peerClosedWithUnreadError，
+//     同时满足 ErrPeerClosedWithUnread 与 io.EOF；异常结束时 Cause() 带真实原因。
+//     数据仍可读，但连接已经结束：probe 会映射成 StatusPeerClosedWithUnread
+//     或 StatusPeerResetWithUnread，**不能**当成干净存活。
 //   - (probeUnsupported, nil):    内核探测不可用，由调用方决定兜底策略
 //
-// 检查顺序：本地关闭状态 → SO_ERROR → poll/WSAPoll 探测。
+// 检查顺序：本地关闭状态 → SO_ERROR → poll/WSAPoll/MSG_PEEK 探测。
 //
 // socketError 返回 ErrUnsupported 时直接返回 probeUnsupported：
 // socketError 与 probeConn 都通过 syscallConnOf 解包 fd，前者拿不到 fd 时

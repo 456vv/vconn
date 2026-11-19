@@ -2,488 +2,375 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/456vv/vconn.svg)](https://pkg.go.dev/github.com/456vv/vconn)
 
-golang vconn：给任意 `net.Conn` 加上**「连接断开提前通知」**能力。
+`vconn` 把任意 `net.Conn` 包成一条带**连接状态**的连接。它回答两个标准库没有直接给出的问题：
 
-- 对端断开（FIN/RST）可在**不读取、不消耗任何数据**的前提下被感知；
-- 即使对端"先发数据再断开"，也能立即收到通知（不再被预读缓冲卡住）；
-- 绝不改写调用方设置的 `ReadDeadline`，不会让 `Read` 意外永久阻塞；
-- 每条连接至多 1 个常驻监控协程，不做 per-read goroutine，订阅关闭通知**几乎零开销**；
-- 前台读串行化，多 goroutine 并发 `Read` 安全，且不会互相注入伪超时。
+- 对端是不是已经结束，哪怕本端还没把数据读完，也还没等到 `Read` 返回 `io.EOF`；
+- 这条连接现在能不能交给下一个使用者。
 
-## 快速开始
+探测在能拿到 socket 时不消耗字节。通知只说明发生了什么，**不会替你关闭底层连接**。
+
+```
+go get github.com/456vv/vconn
+```
+
+要求 Go 1.25 及以上。
+
+## 它补上的三件事
+
+标准 `net.Conn` 只有在 `Read` 碰到流结束时才知道对端走了。这在三种场景里不够用：
+
+| 场景 | 只用 `Read` 的问题 | `vconn` 的做法 |
+|---|---|---|
+| 对端先发数据再 `FIN` | 必须把缓冲读空才看得到结束 | 内核探测区分「还有数据」和「队列已空」 |
+| 只写不读（上传、推送、请求已发出） | 永远等不到 `EOF` | 空闲时按周期做零消耗探测 |
+| 连接放回池子之前 | 不知道里面是否残留字节或半开 | `CheckReusable` 只接受干净存活 |
+
+`New` 本身不启动后台协程。第一次 `CloseNotify` 或 `WatchClose` 才为一整条连接启动**一个**监控协程。没有人订阅时，不做周期探测。
+
+## 五分钟接上
 
 ```go
-conn, err := net.Dial("tcp", "127.0.0.1:8080")
+raw, err := net.Dial("tcp", "127.0.0.1:8080")
 if err != nil {
     return err
 }
-vc := vconn.New(conn)
-defer vc.Close()
+c := vconn.New(raw)
+defer c.Close()
 
-// 方式一：订阅关闭通知（可长期使用，退出前请 Close，避免泄漏）
 go func() {
-    if err := <-vc.CloseNotify(); err != nil {
-        log.Printf("连接已断开: %v", err)
+    err := <-c.CloseNotify()
+    switch {
+    case errors.Is(err, vconn.ErrPeerClosedWithUnread):
+        // 对端已经结束，但还有字节没取走。先读完再 Close。
+        io.Copy(io.Discard, c)
+        c.Close()
+    case errors.Is(err, io.EOF):
+        c.Close()
+    default:
+        log.Printf("连接结束: %v", err)
+        c.Close()
     }
 }()
-
-// 方式二：需要退订时使用 WatchClose
-ch, cancel := vc.WatchClose()
-defer cancel()
-
-// 方式三：同一连接反复订阅（每轮事件都要通知）—— 通知落定后重置再订阅
-for {
-    ch := vc.CloseNotify()
-    <-ch
-    if err := vc.ResetNotify(false); err != nil { // 本地已关闭/对端已断开时会被拒绝
-        break
-    }
-}
 ```
 
-## 接口
+`ErrPeerClosedWithUnread` 同时满足 `errors.Is(err, io.EOF)`。只判断 `EOF` 的旧逻辑行为不变；需要「先读完再收尾」时再加一个判断。
+
+收到通知后是否关闭由调用方决定。对端只关闭写方向时，本端仍可能要写完响应；库如果在通知里直接 `Close`，会把这种半关闭变成全关闭。
+
+## 三个日常问题
+
+### 连接是不是已经结束
 
 ```go
-type CloseNotifier interface {                          // 关闭通知接口
-    CloseNotify() <-chan error                          // 关闭通知
-}
-
-type Conn struct{}                                      // 连接
-
-// 构造
-func New(c net.Conn) *Conn                              // 包装连接
-func NewData(c net.Conn, b []byte) *Conn                // 包装连接并预置已到达的数据
-
-// net.Conn 实现
-func (T *Conn) Read(b []byte) (n int, err error)         // 读取
-func (T *Conn) Write(b []byte) (n int, err error)        // 写入
-func (T *Conn) Close() error                             // 关闭（幂等，返回首次错误）
-func (T *Conn) LocalAddr() net.Addr                      // 本地地址（关闭后仍有效）
-func (T *Conn) RemoteAddr() net.Addr                     // 远程地址（关闭后仍有效）
-func (T *Conn) SetDeadline(t time.Time) error            // 读写超时（关闭后返回 net.ErrClosed）
-func (T *Conn) SetReadDeadline(t time.Time) error        // 读超时
-func (T *Conn) SetWriteDeadline(t time.Time) error       // 写超时
-func (T *Conn) SetReadBuffer(bytes int) error            // 系统接收缓冲区
-func (T *Conn) SetWriteBuffer(bytes int) error           // 系统发送缓冲区
-func (T *Conn) SetKeepAlive(v bool) error                // TCP keepalive 开关
-func (T *Conn) SetKeepAlivePeriod(d time.Duration) error // TCP keepalive 周期
-func (T *Conn) SetLinger(sec int) error                  // 关闭 linger 行为
-func (T *Conn) CloseWrite() error                        // 半关闭写方向
-func (T *Conn) CloseRead() error                         // 半关闭读方向
-
-// 关闭通知
-func (T *Conn) CloseNotify() <-chan error                // 获取关闭通知（不可退订）
-func (T *Conn) WatchClose() (<-chan error, func())       // 获取关闭通知 + 退订函数
-func (T *Conn) CancelNotify(err error) bool              // 主动分发一次关闭通知（上锁，不可逆）
-func (T *Conn) ResetNotify(force bool) error             // 清除已落定状态，重新武装（可反复订阅）
-func (T *Conn) WithContext(ctx context.Context)          // 上下文取消时「通知」
-func (T *Conn) WithContextClose(ctx context.Context)     // 上下文取消时「关闭连接」
-
-// 状态与错误分类（同一个类型、同一套常量）
-func (T *Conn) IsPeerClosed() bool                       // 是否探测到对端已关闭
-func (T *Conn) Err() error                               // 关闭原因（连接级首次落定的结论）
-func (T *Conn) Check() (Status, error)                   // 主动探测：结论 + 本次原因（非阻塞、不消耗数据）
-func (T *Conn) CheckBlocking() (Status, error)           // 主动探测（内核探测不可用时退化为阻塞预读）
-func (T *Conn) CheckReusable() (Status, error)           // 连接池判定：仅 StatusAlive 可复用
-func (T *Conn) Snapshot() Status                         // 不探测的纯快照（永不返回 StatusAlive）
-func StatusOf(err error) Status                          // 错误 → 同一个 Status（唯一入口，适用于 Read/CloseNotify/Check*）
-
-// 配置
-func (T *Conn) SetBackgroundReadBuffer(n int)            // 预读字节数：>0 预读、0 关闭、<0 丢弃
-func (T *Conn) SetReadLimit(remain int64)                // 限制读取字节数，超出返回 ErrQuotaExhausted（匹配 io.EOF）
-func (T *Conn) SetMonitorInterval(d time.Duration)       // 空闲探测周期，默认 200ms
-
-// 原始连接提取（各只能调用一次，重复调用 panic）
-func (T *Conn) RawConn() net.Conn                        // 归还底层连接
-func (T *Conn) RawConnFull() (net.Conn, []byte)          // 归还底层连接 + 未消费的预读字节
-```
-
-## 参数速查
-
-| 方法 | 取值 | 语义 |
-|---|---|---|
-| `SetBackgroundReadBuffer` | `0`（默认） | 关闭后台预读，仅保留内核级关闭探测；`net.Pipe`/自定义连接需 `n > 0` 才能检测对端关闭 |
-| | `n > 0` | 预读最多 n 字节（上限 1 MiB），供 `Read` / `RawConnFull` 使用 |
-| | `n = 0` | 关闭预读，仅保留内核级关闭探测 |
-| | `n < 0` | 丢弃模式：读到的数据直接丢弃，**会丢数据**；单次读取长度为 `max(\|n\|, 4 KiB)`（上限 1 MiB，且该缓冲随连接常驻） |
-| `SetReadLimit` | `-1` | 不限制 |
-| | `>= 0` | 剩余可读字节数，为 0 时 `Read` 返回 `ErrQuotaExhausted`（`%w` 包住 `io.EOF`，`errors.Is(err, io.EOF)` 仍成立；不会触发关闭通知） |
-| `SetMonitorInterval` | `<= 0` | 恢复默认 200ms |
-| | `10ms ~` | 空闲连接的探测周期（灵敏度 / CPU 折中） |
-
-## 状态与错误分类
-
-一次探测只有一份实现（`Conn.probe`），对外暴露成几个视图；错误只有一个分类入口（`StatusOf`）。
-两者给出的是**同一个类型** `Status`。
-
-### 观测轴：连接现在怎么样
-
-```go
-st, err := c.Check()                 // 非阻塞、零消耗探测
+st, err := c.Check() // 非阻塞，不消耗字节
 switch st.Class() {
-case vconn.StatusAlive:               // 存活且当前无数据
-case vconn.StatusDataPending:         // 存活，但有未读数据（协议失步）
-case vconn.StatusPeerClosed:          // 对端已结束，数据已读空
-case vconn.StatusPeerClosedWithUnread:// 对端已结束，但还有数据：先 drain 再收尾
-case vconn.StatusPeerReset:           // 对端异常中断（RST/EPIPE/截断）
-case vconn.StatusLocalClosed:         // 本地已 Close / RawConn 提取
-case vconn.StatusUnverified:          // 无法判定 —— 不是死亡
+case vconn.StatusAlive:
+    // 已确认存活，当前没有待读数据
+case vconn.StatusDataPending:
+    // 还活着，但已经有数据。对探活来说是活的，对连接池来说是脏的
+case vconn.StatusPeerClosed:
+    // 干净结束，接收队列已空
+case vconn.StatusPeerClosedWithUnread:
+    // 干净结束，但仍有数据：先读完
+case vconn.StatusPeerReset, vconn.StatusPeerResetWithUnread:
+    // RST、断网、对端异常中止
+case vconn.StatusLocalClosed:
+    // 本端 Close，或原始连接已被取走
+case vconn.StatusUnverified:
+    // 这条连接拿不到 fd。这不是死亡
 }
 ```
 
-`Status` 用一个字节同时表达「类别」与「是否还有未读数据」，因此
-`StatusPeerClosedWithUnread == StatusPeerClosed | flagUnread`，用 `Class()` 做 `switch`
-不会被修饰位干扰。
+`CheckBlocking` 与 `Check` 的结论空间相同。差别只在拿不到 fd 时：前者会在确认读取安全后，用 2ms 超时读 1 字节；后者直接返回 `StatusUnverified`。
 
-| 方法 | 回答的问题 | 特点 |旧版 CheckA
-|---|---|---|
-| `Check() (Status, error)` | 现在怎么样 | 非阻塞；无 fd 连接返回 `StatusUnverified` |
-| `CheckBlocking() (Status, error)` | 同上，但会读 1 字节 | 无 fd 连接退化为 2ms 阻塞预读；额度由 `SetBackgroundReadBuffer` 决定 |
-| `CheckReusable() (Status, error)` | 能不能交给下一个使用者 | 仅 `StatusAlive` 返回 `nil`；错误都匹配 `ErrNotReusable` |
-| `Snapshot() Status` | 已经知道了什么 | **不探测**，永不返回 `StatusAlive`（缓存无法证明「还活着」），因此过期也是安全的 |
-
-**选型口诀**：
-
-- `Check` 答「**活不活**」，`CheckReusable` 答「**能不能借给别人**」，`Snapshot` 答「**我已经知道什么**」。
-- 旧版 `CheckAlive()/CheckAliveBlocking()` 已移除（v2 起被 `Check()/CheckBlocking()` 取代）。
-  迁移对照：
-
-
-### 处置轴：我该怎么做
-
-```go
-switch vconn.StatusOf(err) {              // 同一个入口适用于 Read / Write / CloseNotify / Check*
-case vconn.StatusPeerClosed:              // 对端正常结束 → 先 drain；幂等请求可重试
-case vconn.StatusPeerReset:               // 异常中断 → 换连接；非幂等请求不要重试
-case vconn.StatusLocalClosed,             // 本地已关闭
-	vconn.StatusDataPending:              // 有残留数据 → 丢弃
-case vconn.StatusBusy,                    // 被占用 / 落定通知未重置 → 退避重试
-	vconn.StatusUnverified:
-case vconn.StatusQuota,                   // SetReadLimit 用尽
-	vconn.StatusLatched:
-case vconn.StatusTimeout:                 // 自己的 deadline（连接未必坏）
-case vconn.StatusMisuse,                  // 用法错误 → 修代码
-	vconn.StatusUnsupported:
-}
-```
-
-### 两个轴共用同一个类型
-
-| 谓词 | 轴 | 回答的问题 |
-|---|---|---|
-| `Readable()` | 观测 | 现在还能读出数据吗（`StatusPeerClosedWithUnread` 也返回 `true`） |
-| `Reusable()` | 观测 | 能交给下一个使用者吗 |
-| `Ended()` | 观测 | 对端 / 本地已经结束了吗 |
-| `Unread()` | 观测 | 是否还有未读数据 |
-| `Retryable()` | 处置 | 换连接 / 稍后重试有意义吗 |
-| `Terminal()` | 处置 | 这条连接还能用吗 |
-
-三条关系（都有测试盯着）：
-
-- `Reusable()` ⟺ `StatusAlive`，且 `Reusable() ⇒ Readable()`；
-- `Ended() ⊂ Terminal()`：`StatusDataPending` / `StatusQuota` 是「终结但未结束」——
-  连接可能还活着，但不能再交给下一个人；
-- `StatusTimeout / StatusMisuse / StatusUnsupported / StatusUnknown` 只出现在错误空间，
-  `Check*` / `Snapshot` 永不返回它们。
-
-十余个哨兵 + 标准库错误 + 各平台 errno 在这里收敛成上面这套类别。需要精确细节时继续用
-`errors.Is`；自定义错误实现 `Statuser`（`Status() Status`）即可接入同一套分类。
-
-连接池用法：
+### 能不能放回连接池
 
 ```go
 st, err := c.CheckReusable()
 if err != nil {
-    metrics.Drop(st.String(), vconn.StatusOf(err).String(), err) // 两轴都是 Status：同一种 label
-    _ = c.Close()
-    return 换一条连接重试
+    // err 一定满足 errors.Is(err, vconn.ErrNotReusable)
+    log.Printf("丢弃连接: status=%s class=%s err=%v",
+        st, vconn.StatusOf(err), err)
+    c.Close()
+    return nil
 }
-// st == vconn.StatusAlive：可以放心交给下一个使用者
+pool.Put(c) // 此时 st 一定是 StatusAlive
 ```
 
-## CheckBlocking 与安全阻塞探测
+`CheckReusable` 比 `Check` 更严。有残留数据、前台正在读、通知已锁存、读配额耗尽、无法验证，全部不能复用。
 
-`CheckBlocking` 在内核探测（`SO_ERROR` + `poll`/`WSAPoll`）不可用时，**额外**尝试一次带短超时的阻塞预读探测。
+不要对「服务端会主动推消息」的协议使用它。这类连接空闲时本来就可能有未读字节，结果会稳定地落在 `StatusDataPending`。
 
-它走两条路径：
+### 这个错误该怎么处理
 
-| 路径 | 触发条件 | 行为 | 数据安全 |
-|---|---|---|---|
-| 内核探测 | 连接能解包到 `syscall.Conn`（`*net.TCPConn`、`*tls.Conn` 等） | 零字节消耗，直接返回结果 | ✅ 不碰数据 |
-| 阻塞预读 | 拿不到 fd（`net.Pipe`、未知 wrapper 等） | 读 **1 字节**（带 2ms 超时），放入 peek 缓冲 | ✅ 前台 `Read` 优先消费 |
+`StatusOf` 是唯一的错误分类入口，`Read`、`Write`、`CloseNotify` 和 `Check*` 都能用：
 
-**探活不产生副作用**：`CheckBlocking` 只对**本次调用**使用 4 KiB 的预读额度，
-不会把 `peekSize` 写回连接，因此「探活一次」不会悄悄打开后台预读。
-（旧实现会 `CAS(0 → 4096)`，导致一次探活就永久开启后台读。）
+```go
+switch vconn.StatusOf(err).Class() {
+case vconn.StatusPeerClosed:
+    // 对端正常收尾。幂等请求可以换连接重试；请求可能已经执行完
+case vconn.StatusPeerReset:
+    // 异常中断。换连接；非幂等请求不要直接重试
+case vconn.StatusDataPending:
+    // 协议失步或残留响应。不要交给下一个人
+case vconn.StatusBusy, vconn.StatusUnverified:
+    // 此刻无法判定。稍后重试，不要当成死亡
+case vconn.StatusTimeout:
+    // 调用方自己的 deadline。连接不一定坏
+case vconn.StatusQuota:
+    // SetReadLimit 用尽。调大或重置限额，不是断线
+case vconn.StatusLatched:
+    // 这一轮通知被 CancelNotify / Context 取消锁住
+case vconn.StatusLocalClosed:
+    // 本端已经关闭
+case vconn.StatusMisuse, vconn.StatusUnsupported:
+    // 用法或平台不支持。修调用，不要重试
+}
+```
 
-**阻塞预读只对「明确可安全读取」的连接开放**，避免误读 `*tls.Conn` 破坏握手/记录边界。判定规则（`isBlockProbeSafe`）：
+自定义错误可以实现 `Statuser`：
 
-| 连接形态 | 判定 | 理由 |
+```go
+type Statuser interface {
+    Status() vconn.Status
+}
+```
+
+没有实现时，无法归类的错误是 `StatusUnknown`。`Status()` 必须是纯函数，不要在里面读 socket。
+
+## 状态怎么读
+
+`Status` 用一个字节同时表达类别和「还有没有未读数据」：
+
+```text
+低 4 位 = 类别
+第 4 位 = 仍有未读数据
+```
+
+因此 `StatusPeerClosedWithUnread` 就是 `StatusPeerClosed` 加上未读标志。`switch` 请用 `Class()`，否则带未读标志的值会掉进 `default`。
+
+| 结论 | 含义 | 还读得出来 | 能给下一个人 | 已经结束 |
+|---|---|---:|---:|---:|
+| `StatusAlive` | 干净存活 | 是 | 是 | 否 |
+| `StatusDataPending` | 有残留数据 | 是 | 否 | 否 |
+| `StatusPeerClosed` | 干净 `FIN`，队列已空 | 否 | 否 | 是 |
+| `StatusPeerClosedWithUnread` | 干净 `FIN`，还有数据 | 是 | 否 | 是 |
+| `StatusPeerReset` | 异常断开，队列已空 | 否 | 否 | 是 |
+| `StatusPeerResetWithUnread` | 异常断开，还有数据 | 是 | 否 | 是 |
+| `StatusLocalClosed` | 本端已关闭或已取走原连接 | 否 | 否 | 是 |
+| `StatusUnverified` | 无法验证 | 否 | 否 | 否 |
+| `StatusBusy` | 前台正在读 | 否 | 否 | 否 |
+| `StatusLatched` | 通知已锁存，连接未必坏 | 否 | 否 | 否 |
+| `StatusQuota` | 读配额用尽 | 否 | 否 | 否 |
+
+后四个只出现在错误分类里，探测方法不会返回它们：`StatusTimeout`、`StatusMisuse`、`StatusUnsupported`、`StatusUnknown`。
+
+几个谓词的关系：
+
+- `Reusable()` 只在 `StatusAlive` 时为真，并且可复用一定还可读；
+- `Ended()` 只包含对端结束和本端关闭；
+- `Terminal()` 比 `Ended()` 多两个：有残留数据、读配额用尽。连接可能还活着，但不能再交给别人；
+- `PeerDown()` 只看对端，本端 `Close` 不算；
+- `Retryable()` 表示换连接或稍后重试有意义，不表示这次请求一定没有执行。
+
+`Snapshot()` 不探测。它只报告已经确定的事实，所以**永远不返回 `StatusAlive`**：一份缓存证明不了对端现在还活着。已知结束时用它可以省掉一次系统调用；要肯定「还活着」，调用 `Check`。
+
+## 通知的生命周期
+
+关闭通知是一轮一次性事件：
+
+```text
+订阅 → 等待 → 某个原因首次落定 → 本轮所有 channel 收到同一个错误并关闭
+```
+
+落定之后，新的订阅会立刻拿到同一个原因。同一条连接要监听下一轮，必须先 `ResetNotify`，再重新订阅。旧 channel 不会被第二次写入。
+
+```go
+ch, cancel := c.WatchClose()
+defer cancel()
+
+select {
+case err := <-ch:
+    log.Printf("本轮结束: %v", err)
+case <-time.After(time.Minute):
+    cancel() // 只撤销自己的订阅，不关闭连接，也不影响其它订阅者
+}
+```
+
+`CloseNotify` 是不能退订的 `WatchClose`。生命周期跟连接一样长的等待可以用它；请求级、可取消的等待用 `WatchClose`。
+
+| 方法 | 做什么 | 不做什么 |
 |---|---|---|
-| 直接 `syscall.Conn`（`*net.TCPConn` 等） | ✅ 允许 | 用户自己的 fd 实现，读的是原始字节流 |
-| 实现了 `SafeBlockProber` | 以 `SafeToBlockProbe()` 为准 | 显式表态优先（可 opt-in 也可 opt-out） |
-| 包装型连接（声明了 `NetConn() net.Conn`） | ❌ 跳过 | 可能隐藏 TLS/多路复用等有副作用的 `Read` |
-| 其它叶子连接（`net.Pipe`、内存管道） | ✅ 允许 | 无协议状态机，读到的就是应用字节 |
+| `CloseNotify` | 返回本轮通知 channel，并在首次调用时启动监控 | 不提供退订 |
+| `WatchClose` | 返回 channel 和幂等退订函数 | 退订不产生错误值，只关闭 channel |
+| `CancelNotify(err)` | 主动落定一轮。`nil` 会写成 `ErrNotifyCanceled` | 不关闭底层连接 |
+| `ResetNotify(false)` | 清掉可恢复的锁存，有订阅者时重启监控 | 本端已关闭或对端已断开时拒绝 |
+| `ResetNotify(true)` | 连「对端已断开」的锁存也清掉，并立即重新探测 | 仍然越不过本端 `Close` / `RawConn` |
+| `WithContext` | `ctx` 结束时落定通知，原因是 `ctx.Err()` | 不打断正在阻塞的 `Read` |
+| `WithContextClose` | `ctx` 结束时调用 `Close` | 会真正断开底层连接 |
 
-裸 `net.Pipe` 默认允许阻塞探测，这是 `SetBackgroundReadBuffer` 文档承诺的语义：
-这类连接没有内核就绪事件，只能靠「带短超时的阻塞预读」发现对端关闭。
-如果你有一个**会隐藏 TLS 但没实现 `NetConn()`** 的自定义连接，请显式 opt-out：
+`ResetNotify` 的三个拒绝理由需要分开处理：
 
-```go
-type myHiddenTLS struct{ /* ... */ }
+| 返回值 | 原因 | 下一步 |
+|---|---|---|
+| `ErrResetPeerDown` | 已经确认对端结束 | 默认丢掉连接。只有确认要再上报一次时才用 `ResetNotify(true)` |
+| `ErrResetLocallyClosed` | 本端已 `Close` 或已取走原连接 | 不能恢复。`force` 也无效 |
+| `ErrResetTimeout` | 上一轮监控还卡在预读里，但锁存已经清空 | 直接重试，不会因此启动第二轮监控 |
 
-func (myHiddenTLS) SafeToBlockProbe() bool { return false } // 禁止阻塞探测
-```
+`CancelNotify` 与 `ResetNotify` 方向相反。前者把「未落定」变成「已落定」，后者把「已落定」变回「未落定」。
 
-### 示例 1：TLS，推荐写法（零风险）
+## 读取、预读和限额
 
-`*tls.Conn` 自带 `NetConn()`，`syscallConnOf` 会自动解包到 `*net.TCPConn`，走**内核探测路径**，不碰 TLS 层：
+`Read` 的交付顺序是：
 
-```go
-tlsConn, err := tls.Dial("tcp", "server:443", cfg)
-if err != nil {
-    return err
-}
+1. 上次已经取到数据、但按 `io.Reader` 惯例延后返回的终止错误；
+2. `SetReadLimit` 的剩余配额；
+3. 本包预读缓冲里的字节；
+4. 底层连接的 `Read`。
 
-c := vconn.New(tlsConn)
-defer c.Close()
-
-// 走内核探测：WSAPoll / poll(2)，零字节消耗
-st, err := c.CheckBlocking()
-if st.Ended() {
-    log.Printf("connection dead: %v (%v)", st, err)
-    return
-}
-```
-
-数据安全要点：
-
-- 探测对象是**底层 TCP socket**，看到的是密文可读与否，**不会触发 TLS 握手**；
-- `CheckBlocking` 在 `probeConn` 返回 `probeIdle`/`probeReadable` 时直接报告存活（`StatusAlive`），**不会进入 `peekProbe`**，不读任何字节。
-
-### 示例 2：TLS 外包了 wrapper（安全降级，不报错）
-
-如果 wrapper 忘了实现 `NetConn()`，`CheckBlocking` 会走 `probeUnsupported` 分支；由于连接不是 `syscall.Conn`、也不是 `SafeBlockProber`，**默认跳过阻塞预读**，返回 `StatusUnverified`（fail-open，不是死亡）：
+有字节时返回 `(n, nil)`，终止错误留到下一次。这样调用方不会因为同时看到数据和 `EOF` 而丢掉最后一段。
 
 ```go
-type myWrapper struct {
-    conn *tls.Conn
-}
-// 实现 net.Conn 全部方法，但**没有** NetConn()
-
-w := &myWrapper{conn: tlsConn}
-c := vconn.New(w)
-
-// 安全：不会读 TLS 层，不会触发握手，不会丢数据
-// StatusUnverified 表示「无法探测」，不是死亡
-st, err := c.CheckBlocking()
-if st.Class() == vconn.StatusUnverified {
-    // 只有内核探测（若 wrapper 恰好能解包）才会给出确定结论
-    log.Printf("unverified: %v", err)
-}
+c.SetBackgroundReadBuffer(32 << 10) // 空闲时最多预读 32 KiB
+c.SetReadLimit(1 << 20)             // 本次响应最多向调用方交付 1 MiB
+c.SetMonitorInterval(100 * time.Millisecond)
 ```
 
-**推荐做法**：给 wrapper 加一行 `NetConn()`，让它能解包到 `*tls.Conn` → `*net.TCPConn`，升级为内核探测路径：
+`SetBackgroundReadBuffer` 的符号决定后台读的用途：
 
-```go
-func (w *myWrapper) NetConn() net.Conn { return w.conn }
+| 值 | 行为 | 适合 |
+|---|---|---|
+| `0` | 不预读。有 fd 时仍做内核级关闭探测 | 默认值，也是连接池的正确选择 |
+| `> 0` | 连接空闲时把最多这么多字节放进预读缓冲 | 希望对端一发数据就能尽快读到 |
+| `< 0` | 空闲时直接丢弃读到的字节 | 明确不关心数据、只想发现关闭。**会丢数据** |
+
+绝对值超过 1 MiB 会截成 1 MiB。缓冲按连接保留；曾经用过很大的丢弃长度后，需求降到 64 KiB 以下时会释放那块大缓冲。
+
+显式调用过 `SetBackgroundReadBuffer` 之后，`CheckBlocking` 和 `CheckReusable` 不再使用自己的默认 4 KiB 额度。设为 `0` 或负数都表示「这次探测不准读数据」，无 fd 连接因此返回 `StatusUnverified`。
+
+`SetReadLimit(n)`：
+
+- `n < 0`：取消限额；
+- `n >= 0`：之后还可交付给调用方的字节数；
+- 限额用尽返回 `ErrQuotaExhausted`。它满足 `io.EOF`，但 `StatusOf` 给出 `StatusQuota`，不会把连接标成对端已关闭。
+
+`SetMonitorInterval` 是空闲连接两次探测之间的间隔，不是探测的超时。小于等于 `0` 恢复默认 200ms，低于 10ms 会提升到 10ms。正在运行的监控会被立刻唤醒并使用新间隔。
+
+## 哪些连接可以安全探测
+
+探测分两条路：
+
+```text
+能解包出 syscall.Conn
+    → SO_ERROR + poll / WSAPoll + 零消耗查看
+      TCP、Unix socket、以及实现了 NetConn() 的 *tls.Conn 走这里
+
+不能解包
+    → 只有 CheckBlocking / CheckReusable 才可能读 1 字节
+      读不读由 SafeBlockProber 和连接形态决定
 ```
 
-### 示例 3：`net.Pipe`（开箱即可阻塞探测）
-
-`net.Pipe` 是纯内存管道，没有 fd，`probeUnsupported` 恒成立。它属于「叶子连接」，
-默认允许阻塞探测，无需额外包装：
-
-```go
-a, b := net.Pipe()
-defer a.Close()
-defer b.Close()
-
-c := vconn.New(a)
-defer c.Close()
-
-// 直接可用：读 1 字节（带 2ms 超时），数据进 peek 缓冲
-st, err := c.CheckBlocking()
-if st.Ended() {
-    log.Printf("peer down: %v (%v)", st, err)
-}
-```
-
-`WrapSafeBlockProbe` 仍然保留，用于把**包装型连接**（声明了 `NetConn()`、默认被跳过）
-显式升级为可阻塞探测：
-
-```go
-type wrapper struct{ conn net.Conn }
-func (w *wrapper) NetConn() net.Conn { return w.conn }
-// ... 其余 net.Conn 方法
-
-c := vconn.New(vconn.WrapSafeBlockProbe(&wrapper{conn: a}))
-```
-
-### 示例 4：自定义内存连接（实现 `SafeBlockProber`）
-
-纯内存字节流、不维护协议状态机的连接，可以直接实现接口，无需包装：
-
-```go
-type memConn struct {
-    // 实现 net.Conn 的全部方法...
-}
-
-func (m *memConn) SafeToBlockProbe() bool { return true } // 显式承诺可安全阻塞读
-
-c := vconn.New(&memConn{})
-defer c.Close()
-
-st, err := c.CheckBlocking()
-if st.Ended() {
-    log.Printf("peer down: %v (%v)", st, err)
-}
-```
-
-### ⚠️ 反例：这些连接**不要**声明 `SafeBlockProber`
-
-提前 `Read` 会破坏内部状态机的连接，**绝不能**实现 `SafeToBlockProbe() bool` 返回 `true`，也**不要**对它们使用 `WrapSafeBlockProbe`：
-
-| 连接类型 | 后果 |
+| 连接 | 实际路径 |
 |---|---|
-| `*tls.Conn` 及其 wrapper | `Read` 触发 `Handshake()`，2ms 超时导致握手失败且**永久不可用**；预读还会把 TLS 记录搬进 peek 缓冲 |
-| HTTP/2 多路复用连接 | 提前读会吞掉帧头，整个帧解析失败 |
-| yamux / smux 等多路复用 | 提前读会吞掉子流数据 |
-| 任何「首次 `Read` 有副作用」的连接 | 副作用被提前触发 |
+| `*net.TCPConn` | 内核探测，不读应用字节 |
+| 直接包住的 `*tls.Conn` | 自动沿 `NetConn()` 解到 TCP，仍是内核探测 |
+| 有 `NetConn()` 的包装 | 最多向下解 8 层；解到 socket 就走内核探测 |
+| 无 `NetConn()` 的包装 | 无法判断它里面是不是 TLS，阻塞探测可能被当成叶子连接 |
+| `net.Pipe`、纯内存连接 | 没有 fd，允许 2ms 阻塞读 |
+| `SafeToBlockProbe() == false` | 跳过阻塞读，返回 `StatusUnverified` |
 
-对这些连接，正确做法是：
-
-- 能解包 fd → **什么也不用做**，自动走内核探测（`*tls.Conn` 就是这种情况）；
-- 拿不到 fd → 接受 fail-open（返回 `StatusUnverified`），用其它手段（业务心跳、自己读到的 EOF）保证连接健康。
-
-### 行为速查
-
-| 连接 | `direct` | `SafeBlockProber` | `CheckBlocking` 行为 |
-|---|---|---|---|
-| `*net.TCPConn` | ✅ | — | 内核探测 |
-| `*tls.Conn`（直接包装） | —（自动解包到 TCP） | — | 内核探测 |
-| TLS wrapper（无 `NetConn`） | ❌ | ❌ | 阻塞探测（视为叶子连接）⚠️ 见下 |
-| TLS wrapper（有 `NetConn`） | —（自动解包到 TCP） | — | 内核探测 |
-| `net.Pipe`（裸） | ❌ | ❌ | 阻塞探测（叶子连接，默认允许） |
-| `net.Pipe` + `WrapSafeBlockProbe` | ❌ | ✅ | 阻塞探测 |
-| 自定义内存连接 + `SafeToBlockProbe` | ❌ | ✅ | 阻塞探测 |
-| 任何连接 + `SafeToBlockProbe() false` | — | opt-out | 跳过，返回 `StatusUnverified` |
-| 自定义 `syscall.Conn` | ✅ | — | 阻塞探测（`SyscallConn` 失败时） |
-
-⚠️ **TLS wrapper（无 `NetConn`）这一行是唯一的风险点**：因为它既拿不到 fd、
-又没声明自己是包装，只能按「叶子连接」处理。如果你用这类 wrapper 包了 `*tls.Conn`，
-请务必给它加 `NetConn()`（升级为内核探测），或实现 `SafeToBlockProbe() bool { return false }`（显式 opt-out）。
-
-### 超时参数
-
-| 常量 | 默认值 | 用于 |
-|---|---|---|
-| `peekProbeTimeout` | 2ms | `CheckBlocking` 同步阻塞探测 |
-| `peekReadTimeout` | 10ms | 监控协程后台预读 |
-
-受系统 timer 精度限制，低于 1ms 无意义；同步路径建议 1~5ms。
-
-## 反复订阅 / 重置（多轮通知）
-
-默认语义是「一次性事件」：通知落定后 `notified` 被锁存，之后所有订阅都会立刻得到同一个结果。
-需要在**同一条连接上多轮订阅**（心跳/请求级监控、把断开当作可重复消费的事件）时，用 `ResetNotify` 清除锁存：
+隐藏了 TLS 或多路复用、又没有 `NetConn()` 的包装必须显式拒绝阻塞读：
 
 ```go
-ch := vc.CloseNotify()          // 第 1 轮
-<-ch
-err := vc.ResetNotify(false)    // 清除 notified/closeErr/peerDown，重新武装
-if err != nil { ... }           // 本地已关闭 → ErrResetLocallyClosed；对端已断开 → ErrResetPeerDown
-ch = vc.CloseNotify()           // 第 2 轮：新一轮监控协程，旧 channel 不会被二次投递
+func (w *wrapper) SafeToBlockProbe() bool { return false }
 ```
 
-`force` 参数只有一种用途：对端已断开（`ErrResetPeerDown`）时是否仍然重置。
+更好的修复是把内层连接暴露出来：
 
-| 调用 | 结果 |
-|---|---|
-| `ResetNotify(false)` 未落定时 | 幂等 `nil`，不打断正在工作的监控 |
-| `ResetNotify(false)` 手动通知（`CancelNotify`）后 | `nil`，监控随下一次订阅重启 |
-| `ResetNotify(false)` 对端已断开后 | `ErrResetPeerDown`（需要 `ResetNotify(true)`） |
-| `ResetNotify(true)` 对端已断开后 | `nil`，清空 `peerDown`，监控立刻重新探测到断开并再次通知 |
-| `ResetNotify(任意值)` 本地已 `Close`/`RawConn` | `ErrResetLocallyClosed`（`true` 也越不过） |
-| `ResetNotify(任意值)` 上一轮监控卡在阻塞预读 | 状态已清空，返回 `ErrResetTimeout`，可直接重试 |
+```go
+func (w *wrapper) NetConn() net.Conn { return w.inner }
+```
 
-要点：
+只有「提前 `Read` 不会改变协议状态」的纯字节连接，才实现 `SafeToBlockProbe() bool { return true }`，或使用 `WrapSafeBlockProbe`。不要对 `*tls.Conn`、HTTP/2、yamux、smux 这样做。提前读会触发握手、拆记录或吞掉帧头。
 
-- 旧 channel 一旦投递就永久关闭，**重置不会二次投递**，必须重新订阅；
-- 重置不清空预读缓冲区，也不影响 `Read`/`Write`/`SetReadLimit` 等数据面状态；
-- 监控协程按「轮」管理（每轮独立 `quit/done`），重置后可重新启动，整条连接始终至多 1 个存活实例；
-- 观测能力：不再提供查询「第几轮」或「当前订阅者数量」的接口，如需要请在调用方自行计数；
-- **`CancelNotify` 是上锁（0→1），`ResetNotify` 是解锁（1→0）**，方向相反、不可互换：
-  `CancelNotify(nil)` 会以 `ErrNotifyCanceled` 落定并唤醒所有等待者，不会清空状态。
+`WrapSafeBlockProbe` 会转发底层 `SyscallConn`。包住 `*net.TCPConn` 不会把内核探测降级成阻塞读。
 
-## 检测原理与开销
+## 交还原始连接
 
-| 平台 | 探测手段 | 是否有未读数据也能识别 FIN |
+有两种所有权交还方式，每条连接只能成功调用一次，第二次 panic。
+
+```go
+// 不关心 vconn 已缓冲的字节时：
+raw := c.RawConn()
+
+// 连接池、代理或任何不能丢字节的场景：
+raw, buffered := c.RawConnFull()
+```
+
+`RawConn` 把底层连接交回去，但丢弃本包预读缓冲。`RawConnFull` 会先停掉监控，再取走全部预读字节。调用期间若另有 goroutine 正阻塞在 `Read` 上，那个 `Read` 会被一个过去时间的 deadline 唤醒并返回超时；返回前会恢复调用方原来设置的读超时。
+
+交还后，`vconn.Conn` 的 `Read` / `Write` 返回 `net.ErrClosed`，订阅者收到 `ErrRawConnAlreadyUsed`。底层连接保持打开，关闭责任已经回到调用方。
+
+已经通过 `NewData` 放进缓冲、或后台预读得到的字节，都要靠 `RawConnFull` 才能不丢。
+
+## 平台行为
+
+| 平台 | 零消耗探测 | 对端已结束但队列还有数据 |
 |---|---|---|
-| Linux / Android | `poll(POLLIN/POLLRDHUP)` + `recv(MSG_PEEK)` | ✅ |
-| macOS / iOS / *BSD | `poll(POLLIN)` + `recv(MSG_PEEK)` | ✅（BSD 收到 FIN 只置 `POLLIN`，故必须用 `MSG_PEEK` 复核） |
-| Windows | `WSAPoll(POLLIN)` + `FIONREAD(WSAIoctl)` + 二次 poll 复核 | ✅（不用同步 `WSARecv`，避免并发读导致探针阻塞） |
-| Solaris / illumos / AIX | `recv(MSG_PEEK)` | 缓冲区排空后可识别 |
-| js / wasip1 / plan9 | 无内核探测，退化为「带自身超时的预读」 | 受预读缓冲限制 |
+| Linux、Android | `poll`，包含 `POLLRDHUP`；再用 `recv(MSG_PEEK)` 确认 | 能识别，并保留可能存在的真实错误 |
+| macOS、iOS、FreeBSD、NetBSD、OpenBSD、Dragonfly | `poll` + `recv(MSG_PEEK)` | 能识别。BSD 的纯 `FIN` 往往只给 `POLLIN`，所以不能只看事件位 |
+| Windows | `WSAPoll` + `FIONREAD`，必要时再 poll 一次 | 能识别。不使用同步 `WSARecv`，避免与前台读互相阻塞 |
+| Solaris、illumos、AIX | 一次 `recv(MSG_PEEK)` | 队列里还有字节时先报告可读；读空后才能看到 `FIN` |
+| js、wasip1、plan9 | 没有内核探测 | 只在阻塞读被判定安全时，退化为短超时预读 |
 
-探测结果有四种，其中 `probeReadableHangup`（有未读数据 + 对端已 FIN）是关键区分：
-它表示「可以立刻通知，但**不能**当成接收队列已空」，否则调用方可能提前关闭而丢掉未读数据。
-本包对 `probeClosed` 与 `probeReadableHangup` 的通知语义完全一致：只分发通知，绝不关闭底层。
+「探测不了」一律是 `StatusUnverified`，不是连接死亡，也不是可复用。
 
-只在连接**空闲**（上一周期没有前台读取）时才探测，因此繁忙连接不产生任何额外系统调用；
-空闲连接每 `SetMonitorInterval` 周期一次系统调用（默认 200ms 一次）。
+Windows 上有一个已知边界：Winsock 经常要到真正 `recv` 时才给出 TCP RST。零消耗探测可能先把这种状态看成干净结束；随后前台 `Read` 仍会收到真实的重置错误，库不会把它降级成 `io.EOF`。
 
-## 性能
+## 时间与内存参数
 
-`4 KiB` 读取，内存连接（i7-4700MQ）：
-
-| 场景 | ns/op | 相对开销 |
+| 参数 | 值 | 作用 |
 |---|---|---|
-| 裸 `net.Conn` | ~220 | 1.00x |
-| `vconn` 包装 | ~300 | ~1.35x |
-| `vconn` 包装 + 订阅关闭通知 | ~300 | ~1.35x（通知不额外付费） |
+| 监控周期 | 200ms，可改，最小 10ms | 只作用于空闲连接 |
+| 阻塞探测超时 | 2ms | `CheckBlocking`、`CheckReusable` 和后台等待型预读 |
+| 无超时兜底 | 10ms | 只在内部调用漏传超时时使用 |
+| 停止监控上限 | 1s | `ResetNotify` 超时后返回 `ErrResetTimeout`，状态已经清空 |
+| 单次缓冲下限 | 4 KiB | 丢弃模式的最小读取块 |
+| 单次缓冲上限 | 1 MiB | `SetBackgroundReadBuffer` 的绝对值上限 |
+| 大缓冲保留上限 | 64 KiB | 超过后、下次只需小缓冲时释放 |
 
-旧版本订阅通知后约为包装开销的 7.5 倍（每读一次创建 1 个协程）。
+这些值是库的内部时序，不是业务超时。业务读写超时仍然只用 `SetDeadline`、`SetReadDeadline` 和 `SetWriteDeadline`。后台探测改写 deadline 时会在结束后恢复调用方最后一次设置的值。
 
-## 平台支持
+## 接入时注意
 
-linux / android / windows / darwin / ios / freebsd / netbsd / openbsd / dragonfly / solaris / illumos / aix / js / wasip1 / plan9
-（`go build` 全矩阵通过，其中 js/wasip1/plan9 自动降级为无内核探测模式）
+- 所有导出方法都可并发调用。并发 `Read` 会串行执行，不会互相制造超时。
+- `New(c)` 在 `c` 已经是 `*Conn` 时返回它本身。`New(nil)` 会 panic。
+- `NewData(c, b)` 把 `b` 放进预读缓冲。连接池回收前，这些字节会让 `CheckReusable` 判定为脏。
+- 监控只在连接空闲时探测。繁忙连接由 `Read` / `Write` 的错误路径负责报告断开。
+- 后台探测看到对端结束时只发通知。调用方要关闭时，有未读数据就先读完。
+- `SetKeepAlive`、`SetLinger`、`CloseRead`、`CloseWrite` 等可选能力会原样转给底层；底层没有该方法时返回 `ErrUnsupported`，关闭后返回 `net.ErrClosed`。
+- `LocalAddr` 和 `RemoteAddr` 在 `New` 时复制常见地址类型，关闭后仍可读取。
+- 不要让连接池里的连接开启正数预读。池化判定会把预读字节视为上一个使用者留下的数据。
+- `Snapshot().Ended()` 适合做快速拒绝；它不能代替 `Check` 证明连接存活。
 
-> 2026-11-16 起 `js` / `wasip1` / `plan9` 的交叉编译已恢复（此前被遗留文件 `checkconn_unix.go` 的 `//go:build !windows` 挡住）。
-
-## 测试
+## 开发与测试
 
 ```bash
-go test ./...            # 单元 + 回归
-go test -race ./...      # 竞态检测
-go test -bench . ./...   # 性能
+go test ./...
+go test -race ./...
+go test -bench . ./...
 ```
 
-回归用例分布：
-
-| 文件 | 覆盖内容 |
-|---|---|
-| `conn_test.go` | 基础读写、预读、限流、探活、原始连接提取 |
-| `conn_fix_test.go` | 历史缺陷回归（通知、解阻塞、deadline、并发读、协程增长） |
-| `conn_reset_test.go` | 反复订阅 / `ResetNotify` 多轮语义 |
-| `conn_harden_test.go` | 加固回归：限流含预读、对端 FIN 只通知不关底层、并发 Close 一致、监控补回、`RawConnFull` 零丢失、监控自清、探活无副作用、阻塞探测判定 |
-| `conn_peek_test.go` | 预读/丢弃缓冲长度契约 |
-| `conn_plan2_test.go` | 关闭状态机（`RawConn` 后不再关底层、并发 Close 只关一次）、`RawConnFull` 解阻塞、探测结果分类、选项透传 |
-| `status_test.go` | v3 Status 总表：`StatusOf` 黄金表、谓词总表（观测轴 + 处置轴）、表元不变量、探测只返回观测空间、两轴不漂移（含唯一合法例外）、`Check/CheckBlocking/CheckReusable/Snapshot` 各场景、哨兵 cause 与不降级、并发探测 |
-| `probe_helper_test.go` | 包装链解包、不可比较连接不 panic |
-| `probe_poll_linux_test.go` | Linux `POLLRDHUP` 与 `POLLIN` 的区分（`probeReadableHangup`） |
-| `probe_unix_test.go` | Solaris/illumos/AIX 非 socket fd 返回 `probeUnsupported` |
-| `probe_windows_test.go` | Windows `WSAPoll + FIONREAD` 空闲/可读/FIN 探测 |
-| `errno_*_test.go` | 错误码表（EINVAL 不误判、真断开仍识别） |
-
-跨平台校验：
+跨平台编译检查：
 
 ```bash
-# 全矩阵 go build / go vet（含 illumos）
-for t in linux/amd64 darwin/arm64 freebsd/amd64 openbsd/amd64 illumos/amd64 aix/ppc64 windows/amd64 js/wasm plan9/386; do
-  GOOS=${t%/*} GOARCH=${t#*/} go vet ./...
+for spec in linux/amd64 darwin/arm64 freebsd/amd64 openbsd/amd64 illumos/amd64 aix/ppc64 windows/amd64 js/wasm wasip1/wasm plan9/386; do
+  GOOS=${spec%/*} GOARCH=${spec#*/} go test -c -o NUL .
 done
 ```
 
-> `ios/*` 的 `go vet` 需要 cgo 外部链接（测试二进制限制），但 `go build` 通过。
+Windows 下把 `-o NUL` 换成 `-o NUL.exe` 即可。测试文件覆盖通知生命周期、并发读写、重置、原始连接交还、状态分类，以及 Linux、Windows 和 Unix 探测路径。
+
+## 许可
+
+本项目以仓库中的 `license` 文件为准。

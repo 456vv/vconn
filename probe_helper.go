@@ -7,7 +7,11 @@ import (
 	"syscall"
 )
 
-// syscallConnOf 从连接（或可解包的包装，如 *tls.Conn）中取出 syscall.Conn
+// syscallConnOf 从连接（或可解包的包装，如 *tls.Conn）中取出 syscall.Conn。
+//
+// 最多跟随 8 层 NetConn。这个上限是为了挡住互相返回对方的包装环：
+// 环不会被当成「没有 fd」，而是在有限步数后放弃，返回不支持。
+// 中途出现 nil 也立即放弃，避免对空连接发系统调用。
 func syscallConnOf(c net.Conn) (syscall.Conn, bool) {
 	for i := 0; i < 8 && c != nil; i++ {
 		if sc, ok := c.(syscall.Conn); ok {

@@ -114,17 +114,24 @@ func classifyPeek(outcome peekOutcome, hangup bool) (probeResult, error) {
 	}
 }
 
-// SafeBlockProber 可选接口：非 syscall.Conn 的连接可实现此接口，
-// 显式声明「可以安全地对其发起带超时的阻塞 Read 探测，不会破坏内部状态」。
+// SafeBlockProber 可选接口：连接可显式声明「带超时的阻塞 Read 会不会破坏内部状态」。
+//
+// 它只影响拿不到内核探测、或内核探测返回 probeUnsupported 之后的兜底路径
+// （CheckBlocking / CheckReusable / 后台预读）。能解包到 syscall.Conn 的连接
+// 走 SO_ERROR + poll/WSAPoll，本来就不会读应用层字节。
 //
 // 默认规则（未实现本接口时）：
-//   - 叶子连接（net.Pipe、内存管道、不隐藏内层连接的底层实现）→ 视为可安全阻塞读；
-//   - 包装型连接（实现了 NetConn() net.Conn，如 *tls.Conn 及其 wrapper）→ 视为不可读，
-//     避免提前 Read 触发握手/破坏记录边界或吞掉多路复用的帧头。
+//   - 直接 syscall.Conn（*net.TCPConn 等）→ 可以；
+//   - 包装型连接（实现了 NetConn() net.Conn，如 *tls.Conn 及其 wrapper）→ 不可以，
+//     避免提前 Read 触发握手、破坏记录边界或吞掉多路复用的帧头；
+//   - 其它叶子连接（net.Pipe、内存管道、不隐藏内层连接的底层实现）→ 可以。
+//     这类连接没有内核就绪事件，只能靠短超时阻塞读发现对端关闭。
 //
-// 典型实现者：多路复用/状态机连接在确认安全时显式 opt-in。
-// 反例（务必不要实现）：*tls.Conn 及其 wrapper（Read 会触发握手/剥离记录）、
-// 多路复用协议（HTTP/2、yamux 等，提前读会吞掉帧头）。
+// 返回 true 是 opt-in：调用方承诺「读走的字节就是应用数据，提前读不会改协议状态」。
+// 返回 false 是 opt-out：即使它看起来像叶子连接，也跳过阻塞读并返回 StatusUnverified。
+//
+// 反例（务必不要返回 true）：*tls.Conn 及其隐藏了 TLS 的 wrapper
+// （Read 会触发握手或剥离记录）、HTTP/2、yamux 等多路复用（提前读会吞掉帧头）。
 type SafeBlockProber interface {
 	SafeToBlockProbe() bool
 }
@@ -136,13 +143,15 @@ type safeBlockConn struct {
 
 func (safeBlockConn) SafeToBlockProbe() bool { return true }
 
-// WrapSafeBlockProbe 把连接标记为「可安全阻塞探测」。
+// WrapSafeBlockProbe 把连接标记为「可安全阻塞探测」，等价于让它的 SafeToBlockProbe 返回 true。
 //
-// 仅对确定不会因提前读取而破坏内部状态的连接使用（net.Pipe、内存管道等）。
-// 对 *tls.Conn 或其包装使用会造成 TLS 握手被打断/记录被剥离，切勿使用。
+// 仅对确定不会因提前读取而破坏内部状态的连接使用（纯内存字节流、没有协议状态机的包装）。
+// 对 *tls.Conn 或其包装使用会造成 TLS 握手被打断、记录被剥离，切勿使用。
 //
-// 对已经是 syscall.Conn 的连接（*net.TCPConn 等）无需包装：它们走内核级探测，
-// 根本不会进入阻塞预读分支。
+// 包装会转发底层的 SyscallConn。底层本来就是 *net.TCPConn 时，探测仍走内核路径，
+// 不会因为多包一层就退化成阻塞读；底层不是 syscall.Conn（如 net.Pipe）时，
+// SyscallConn 返回 ErrUnsupported，再按叶子连接的阻塞预读规则处理。
+// 传入 nil 返回 nil。
 func WrapSafeBlockProbe(c net.Conn) net.Conn {
 	if c == nil {
 		return nil

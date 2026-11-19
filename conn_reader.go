@@ -205,6 +205,10 @@ func (r *connReader) Read(p []byte) (n int, err error) {
 
 // resolvePeekBlock 决定本次预读该怎么做。
 //
+// 分开「内核已确认可读」和「需要干等一会儿」是为了保护有协议状态的包装连接：
+// TLS、多路复用的 Read 不是纯字节搬运。只有直接持有 fd 的连接，
+// 才能在内核说「有字节」时安全地把原始字节放进预读缓冲。
+//
 // 返回值含义：
 //
 //	skip=true               → 本次不读，调用方直接返回 (false, nil)
@@ -326,17 +330,21 @@ func (r *connReader) pendingError() (err error, idle bool) {
 //
 // 与 peekStep 的差异：
 //   - 单次读长度固定为 1（peekStep 预读模式读 want = size-have）；
-//   - 预读模式下若 peek 缓冲已达 size 上限，视为「有未读数据 = 连接存活」，
-//     直接返回 probeReadable（不阻塞、不报错、不再读）；
+//   - 预读模式下若 peek 缓冲已达 size 上限，视为「有未读数据」，
+//     直接返回 probeReadable（不阻塞、不报错、不再读）。
+//     这只说明连接上还有数据，不说明它适合复用：上层会映射成 StatusDataPending；
 //   - 丢弃模式下按 1 字节丢弃，不按 minPeekBuf 放大（避免高频探测吞掉大段数据）；
 //     注意：丢弃模式已被 Conn.peekProbeBudget 挡在门外（返回 0 → 不调用本函数），
 //     这里的支持仅为防御性保留；
 //   - stop 传 nil：用户态探活不受监控换代影响，且自身超时保证可被唤醒。
 //
-// 与旧 peekProbe 的关键差异：无法探测（不支持 deadline / 前台在读 /
-// 已本地关闭）时返回 probeUnsupported，而不是伪装成「存活」。
-// CheckReusable 必须能区分「确认存活」与「未能验证」，否则会把状态未知的
-// 连接当作健康连接交给下一个使用者。
+// 无法探测（不支持 deadline / 前台在读 / 已本地关闭）时返回 probeUnsupported，
+// 而不是伪装成「存活」。CheckReusable 必须能区分「确认存活」与「未能验证」，
+// 否则会把状态未知的连接当作健康连接交给下一个使用者。
+//
+// 本地关闭与「底层不支持 deadline」在这里都返回 probeUnsupported：
+// 本地关闭由 probe 在调用前后用 c.closed 改判为 StatusLocalClosed；
+// 不支持 deadline 则保持 StatusUnverified。本函数不下「对端已结束」的结论。
 func (r *connReader) peekProbeStrict(size int) (probeResult, error) {
 	if size == 0 || r.conn.closed.Load() || r.noDeadline.Load() {
 		return probeUnsupported, nil
@@ -366,8 +374,8 @@ func (r *connReader) peekProbeStrict(size int) (probeResult, error) {
 	closed, rerr := r.peekRead(nil, 1, discard, peekTimeout)
 
 	if r.conn.closed.Load() || r.noDeadline.Load() {
-		// 本地已关闭 / 底层不支持 deadline：交给 checkKernel 以 net.ErrClosed
-		// 或 StatusUnverified 如实上报，不能在这里下「对端结论」。
+		// 不下对端结论。本地关闭由 probe 用 c.closed 改判为 StatusLocalClosed；
+		// 不支持 deadline 则保持 probeUnsupported，最终是 StatusUnverified。
 		return probeUnsupported, nil
 	}
 

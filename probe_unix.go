@@ -11,7 +11,14 @@ import (
 
 // probeConn 在不消耗任何字节的前提下探测连接状态：
 // 用 recv(MSG_PEEK) 观察内核接收队列——有数据即存活，返回 0 即对端 FIN。
-// 说明：Solaris/AIX 无 POLLRDHUP，只能"缓冲区排空后"才能识别 FIN。
+//
+// Solaris/illumos/AIX 没有 POLLRDHUP，也没有本包采用的 poll+FIONREAD 组合，
+// 所以这里只能看到「接收队列当前是否为空」。对端已经 FIN、但队列里还有字节时，
+// MSG_PEEK 会返回那 1 字节并报告 probeReadable，关闭通知要等队列被读空后才能发出。
+// 这是平台能力限制，不是把「有数据的挂断」误判成健康：字节仍在内核里，前台 Read 能取走。
+//
+// ENOTSOCK / EOPNOTSUPP / EINVAL 表示这个 fd 不能做 MSG_PEEK（例如不是 socket）。
+// 这种情况返回 probeUnsupported：无法探测不等于已经断开，交给上层决定要不要阻塞预读。
 func probeConn(c net.Conn) (probeResult, error) {
 	sc, ok := syscallConnOf(c)
 	if !ok {

@@ -11,7 +11,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// Windows winsock 常量（部分未在 syscall/x-sys 中导出，此处显式声明）
+// Windows winsock 常量。
+//
+// 这些值直接按 Winsock 文档写死，而不是从 Go 的归一化 errno 反推：
+// SO_ERROR / FIONREAD / poll 事件位是套接字选项和事件掩码，
+// 与 syscall.ECONNRESET 那套 APPLICATION_ERROR 编码不是同一个数域。
+// 写错一个位，探测会恒定空闲或把健康连接报成挂断。
 const (
 	winSOError  = 0x1007     // SO_ERROR
 	winFIONREAD = 0x4004667F // 查询接收队列可读字节数（不消费、不阻塞）
