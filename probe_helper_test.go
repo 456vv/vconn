@@ -4,53 +4,81 @@ package vconn
 
 import (
 	"net"
+	"syscall"
 	"testing"
 )
 
-// uncomparableConn 值语义的 net.Conn，且含不可比较字段（slice）。
-// 旧实现用 map[net.Conn]struct{} 做环检测，对这种连接会直接 panic。
-type uncomparableConn struct {
-	net.Conn
-	buf []byte
-}
+// directConn 让 isDirectSyscallConn 返回 true 的最小实现
+type directConn struct{ net.Conn }
 
-// TestSyscallConnOf_UncomparableConn 对不可比较的连接类型做解包不得 panic。
-func TestSyscallConnOf_UncomparableConn(t *testing.T) {
-	s1, s2 := net.Pipe()
-	defer s2.Close()
+func (d *directConn) SyscallConn() (syscall.RawConn, error) { return nil, nil }
 
-	c := uncomparableConn{Conn: s1, buf: []byte{1, 2, 3}}
+// TestSyscallConnOf 包装链解包 + 不可比较类型不 panic
+func TestSyscallConnOf(t *testing.T) {
+	t.Run("不可比较的连接不 panic", func(t *testing.T) {
+		s1, s2 := pipePair()
+		defer s2.Close()
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("解包不可比较的连接时 panic: %v", r)
+		c := uncomparableConn{Conn: s1, buf: []byte{1, 2, 3}}
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("解包不可比较的连接时 panic: %v", r)
+			}
+		}()
+
+		if _, ok := syscallConnOf(c); ok {
+			t.Fatal("net.Pipe 不应被识别为 syscall.Conn")
 		}
-	}()
 
-	if _, ok := syscallConnOf(c); ok {
-		t.Fatal("net.Pipe 不应被识别为 syscall.Conn")
-	}
+		vc := New(c)
+		defer vc.Close()
+		if st, err := vc.Check(); err != nil || st.Class() != StatusUnverified {
+			t.Fatalf("Check 应 fail-open 为 StatusUnverified，得到 (%v, %v)", st, err)
+		}
+	})
 
-	vc := New(c)
-	defer vc.Close()
-	st, err := vc.Check()
-	if err != nil || st.Class() != StatusUnverified {
-		t.Fatalf("Check 应 fail-open 返回 StatusUnverified，得到 (%v, %v)", st, err)
-	}
+	t.Run("包装链可一路解包", func(t *testing.T) {
+		vc, srv, ln := tcpPair(t)
+		defer ln.Close()
+		defer srv.Close()
+		defer vc.Close()
+
+		inner := &netConnWrapper{Conn: vc.rwc}
+		outer := &netConnWrapper{Conn: inner}
+		if sc, ok := syscallConnOf(outer); !ok || sc == nil {
+			t.Fatal("应能从包装链解包出 syscall.Conn")
+		}
+	})
 }
 
-// TestSyscallConnOf_WrapperChain 包装链应能一路解包到 syscall.Conn
-func TestSyscallConnOf_WrapperChain(t *testing.T) {
-	vc, srv, ln := newTCPPair(t)
-	defer ln.Close()
-	defer srv.Close()
-	defer vc.Close()
+// TestProbe_ResolvePeekBlock 预读策略表
+func TestProbe_ResolvePeekBlock(t *testing.T) {
+	wrap, wrapPeer := pipePair()
+	defer wrapPeer.Close()
+	direct := &directConn{Conn: wrap}
 
-	inner := &netConnWrapper{Conn: vc.rwc}
-	outer := &netConnWrapper{Conn: inner}
+	cases := []struct {
+		name       string
+		c          net.Conn
+		res        probeResult
+		allowBlock bool
+		wantSkip   bool
+		wantBlock  bool
+	}{
+		{"可读/直接", direct, probeReadable, false, false, false},
+		{"可读/包装", wrap, probeReadable, true, true, false},
+		{"空闲/直接/允许阻塞", direct, probeIdle, true, false, true},
+		{"空闲/直接/不允许", direct, probeIdle, false, true, false},
+		{"空闲/包装", wrap, probeIdle, true, true, false},
+		{"不支持/叶子", wrap, probeUnsupported, false, false, true},
+	}
 
-	sc, ok := syscallConnOf(outer)
-	if !ok || sc == nil {
-		t.Fatal("应能从包装链中解包出 syscall.Conn")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			skip, block := resolvePeekBlock(tc.c, tc.res, tc.allowBlock)
+			if skip != tc.wantSkip || block != tc.wantBlock {
+				t.Fatalf("got (skip=%v, block=%v), want (%v, %v)", skip, block, tc.wantSkip, tc.wantBlock)
+			}
+		})
 	}
 }

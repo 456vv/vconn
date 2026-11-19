@@ -4,36 +4,9 @@ package vconn
 
 import (
 	"io"
-	"net"
 	"testing"
 	"time"
 )
-
-// tcpPair 建立一对本地 TCP 连接（返回包装后的客户端、服务端、listener）
-func tcpPair(t *testing.T) (*Conn, net.Conn, net.Listener) {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		c, _ := ln.Accept()
-		accepted <- c
-	}()
-	raw, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		ln.Close()
-		t.Fatal(err)
-	}
-	srv := <-accepted
-	if srv == nil {
-		raw.Close()
-		ln.Close()
-		t.Fatal("accept failed")
-	}
-	return New(raw), srv, ln
-}
 
 // TestProbeConn_WindowsIdleNotClosed 空闲的健康连接必须返回 probeIdle。
 //

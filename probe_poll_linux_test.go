@@ -11,7 +11,7 @@ import (
 // POLLIN|POLLRDHUP。此时必须报 probeReadableHangup（数据可读 + 已断开），
 // 而不是 probeClosed —— 后者会让调用方误以为接收队列已空而提前关闭连接丢数据。
 func TestProbeConn_LinuxHangupWithData(t *testing.T) {
-	vc, srv, ln := newTCPPair(t)
+	vc, srv, ln := tcpPair(t)
 	defer ln.Close()
 	defer vc.Close()
 
@@ -49,7 +49,7 @@ func TestProbeConn_LinuxHangupWithData(t *testing.T) {
 // TestProbeConn_LinuxPeerFINOnEmptyQueue 接收队列为空时收到 FIN，
 // 必须立刻识别为 probeClosed（BSD/macOS 上这种情况只置 POLLIN，是本平台差异点）。
 func TestProbeConn_LinuxPeerFINOnEmptyQueue(t *testing.T) {
-	vc, srv, ln := newTCPPair(t)
+	vc, srv, ln := tcpPair(t)
 	defer ln.Close()
 	defer vc.Close()
 
