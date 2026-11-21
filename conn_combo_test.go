@@ -144,10 +144,10 @@ func TestCombo_APIMatrix(t *testing.T) {
 					assertNoPending(t, ch, tc.name)
 				}
 
-				st, rerr := vc.CheckReusable()
+				rerr := vc.CheckReusable()
 				if tc.wantNext == ErrQuota {
-					if st != StatusQuota || !errors.Is(rerr, ErrNotReusable) || !errors.Is(rerr, ErrQuota) {
-						t.Fatalf("配额耗尽后 CheckReusable = (%v, %v)", st, rerr)
+					if !errors.Is(rerr, ErrQuota) || !errors.Is(rerr, ErrNotReusable) || !errors.Is(rerr, ErrQuota) {
+						t.Fatalf("配额耗尽后 CheckReusable = (%v)", rerr)
 					}
 					if vc.Snapshot() != StatusUnverified && len(tc.want) == len(tc.seed) {
 						// 种子已交完且没有对端结论：快照不能谎称存活，也不能谎称已死。
@@ -220,8 +220,8 @@ func TestCombo_APIMatrix(t *testing.T) {
 		if _, err := srv.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 			t.Fatalf("对端应看到写半关闭 EOF，得到 %v", err)
 		}
-		if st, err := vc.Check(); st != StatusAlive || err != nil {
-			t.Fatalf("写半关闭后 Check = (%v, %v)", st, err)
+		if err := vc.Check(); err != nil {
+			t.Fatalf("写半关闭后 Check = (%v)", err)
 		}
 
 		if _, err := srv.Write([]byte("pong")); err != nil {
@@ -277,15 +277,15 @@ func TestCombo_APIMatrix(t *testing.T) {
 		// 三种探测都不该把用户 deadline 改掉，也不该消费随后到达的字节。
 		for _, call := range []struct {
 			name string
-			fn   func() (Status, error)
+			fn   func() error
 		}{
 			{"Check", vc.Check},
 			{"CheckBlocking", vc.CheckBlocking},
 			{"CheckReusable", vc.CheckReusable},
 		} {
-			st, err := call.fn()
-			if st != StatusAlive || err != nil {
-				t.Fatalf("%s = (%v, %v)", call.name, st, err)
+			err := call.fn()
+			if err != nil {
+				t.Fatalf("%s = (%v)", call.name, err)
 			}
 			if vc.Snapshot() == StatusAlive {
 				t.Fatal("Snapshot 不得在探测成功后宣称存活")
@@ -308,11 +308,11 @@ func TestCombo_APIMatrix(t *testing.T) {
 		pipe := New(a)
 		defer pipe.Close()
 		pipe.SetBackgroundReadBuffer(0)
-		if st, err := pipe.CheckBlocking(); st != StatusUnverified || err != nil {
-			t.Fatalf("显式 0 后 CheckBlocking = (%v, %v)", st, err)
+		if err := pipe.CheckBlocking(); StatusOf(err).Class() != StatusUnverified {
+			t.Fatalf("显式 0 后 CheckBlocking = (%v)", err)
 		}
-		if st, err := pipe.CheckReusable(); st != StatusUnverified || !errors.Is(err, ErrUnverified) {
-			t.Fatalf("显式 0 后 CheckReusable = (%v, %v)", st, err)
+		if err := pipe.CheckReusable(); !errors.Is(err, ErrUnverified) {
+			t.Fatalf("显式 0 后 CheckReusable = (%v)", err)
 		}
 		go func() { b.Write([]byte("Q")) }()
 		pipe.SetReadDeadline(time.Now().Add(time.Second))
@@ -343,9 +343,9 @@ func TestCombo_APIMatrix(t *testing.T) {
 			if st := vc.Snapshot(); st != StatusLatched {
 				t.Fatalf("Snapshot = %v", st)
 			}
-			st, err := vc.CheckReusable()
-			if st != StatusLatched || !errors.Is(err, ErrNotifyLatched) {
-				t.Fatalf("CheckReusable = (%v, %v)", st, err)
+			err := vc.CheckReusable()
+			if !errors.Is(err, ErrNotifyLatched) {
+				t.Fatalf("CheckReusable = (%v)", err)
 			}
 
 			go func() { b.Write([]byte("go")) }()
@@ -557,8 +557,10 @@ func TestCombo_APIMatrix(t *testing.T) {
 			defer b.Close()
 			vc := New(&noProbeConn{Conn: a})
 			defer vc.Close()
-			if st, err := vc.CheckBlocking(); st != StatusUnverified || err != nil {
-				t.Fatalf("CheckBlocking = (%v, %v)", st, err)
+			// 声明 SafeToBlockProbe()=false 的包装不得被阻塞探测：结论只能是
+			// 「无法判定」（StatusUnverified），且不能为了探活而吞掉字节。
+			if err := vc.CheckBlocking(); StatusOf(err) != StatusUnverified {
+				t.Fatalf("CheckBlocking = (%v)，期望 StatusUnverified", err)
 			}
 			go func() { b.Write([]byte("Z")) }()
 			vc.SetReadDeadline(time.Now().Add(time.Second))
@@ -621,25 +623,23 @@ func assertPipeProbe(t *testing.T, setup func(*Conn), want Status, reuse error) 
 	vc := New(a)
 	setup(vc)
 
-	st, err := vc.Check()
-	if st != StatusUnverified || err != nil {
-		t.Fatalf("无 fd 的 Check 应是 unverified，得到 (%v, %v)", st, err)
+	// Check 不阻塞：无 fd 的连接只能报「无法判定」，不是死亡。
+	if err := vc.Check(); StatusOf(err) != StatusUnverified {
+		t.Fatalf("无 fd 的 Check 应是 unverified，得到 %v", err)
 	}
-	st, err = vc.CheckBlocking()
-	if st != want || (want == StatusAlive && err != nil) || (want != StatusAlive && err != nil && !errors.Is(err, io.EOF)) {
-		// CheckBlocking 在无法验证时 error 为 nil，能确认存活时同样为 nil。
-		if err != nil || st != want {
-			t.Fatalf("CheckBlocking = (%v, %v)，期望 %v", st, err, want)
-		}
+	// CheckBlocking 能不能给出结论由预读额度决定：能探 → nil（存活），
+	// 不能探 → StatusUnverified（fail-open，不带原因）。
+	if err := vc.CheckBlocking(); StatusOf(err) != want {
+		t.Fatalf("CheckBlocking = %v，期望 %v", err, want)
 	}
-	st, err = vc.CheckReusable()
+	rerr := vc.CheckReusable()
 	if reuse == nil {
-		if st != StatusAlive || err != nil {
-			t.Fatalf("CheckReusable = (%v, %v)，期望可复用", st, err)
+		if rerr != nil {
+			t.Fatalf("CheckReusable = %v，期望可复用", rerr)
 		}
 		return
 	}
-	if st != want || !errors.Is(err, ErrNotReusable) || !errors.Is(err, reuse) {
-		t.Fatalf("CheckReusable = (%v, %v)，期望 (%v, %v)", st, err, want, reuse)
+	if StatusOf(rerr) != want || !errors.Is(rerr, ErrNotReusable) || !errors.Is(rerr, reuse) {
+		t.Fatalf("CheckReusable = (%v, %v)，期望 (%v, %v)", StatusOf(rerr), rerr, want, reuse)
 	}
 }

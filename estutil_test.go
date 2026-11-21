@@ -110,7 +110,7 @@ func waitStatus(t *testing.T, vc *Conn, want func(Status) bool, d time.Duration)
 	t.Helper()
 	deadline := time.Now().Add(d)
 	for {
-		st, err := vc.Check()
+		st, err := splitProbe(vc.Check())
 		if want(st) || time.Now().After(deadline) {
 			return st, err
 		}
@@ -119,6 +119,29 @@ func waitStatus(t *testing.T, vc *Conn, want func(Status) bool, d time.Duration)
 }
 
 // ==================== 断言 ====================
+
+// splitProbe 把 Check / CheckBlocking / CheckReusable 的单一 error 拆回 (Status, 原因)。
+//
+// 新接口的边界是 error：nil ⟺ StatusAlive，其余结论装在 *result 里。
+// 需要同时断言「结论」与「原因」两轴的用例，用它还原成旧的二元组：
+//   - status：本次观测的完整结论（含 unread 修饰位）；
+//   - cause：真实原因（StatusDataPending / StatusUnverified / StatusBusy 时为 nil）。
+//
+// CheckReusable 的 cause 仍带着 notReusable 包装，errors.Is(err, ErrNotReusable)
+// 与 errors.Is(err, 具体理由) 的旧语义不变。
+//
+// 注意：返回值不是 Check* 的原始 error —— 原始 error 对非 StatusAlive 的结论
+// **永远非 nil**（它是结论的载体），直接拿它判「有没有原因」会恒为真。
+// 第二轴必须取 Cause()：*result 用 Unwrap 暴露原因，因此
+// errors.Is(cause, ErrNotReusable) / errors.Is(cause, ErrDataPending) 仍然成立。
+func splitProbe(err error) (Status, error) {
+	st := StatusOf(err)
+	var causer interface{ Cause() error }
+	if errors.As(err, &causer) {
+		return st, causer.Cause()
+	}
+	return st, err
+}
 
 // awaitErr 等待一次关闭通知。
 func awaitErr(t *testing.T, ch <-chan error, what string) error {

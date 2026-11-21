@@ -130,9 +130,9 @@ func TestConcurrent_Stress(t *testing.T) {
 							return
 						default:
 						}
-						_, _ = vc.Check()
-						_, _ = vc.CheckBlocking()
-						_, _ = vc.CheckReusable()
+						_ = vc.Check()
+						_ = vc.CheckBlocking()
+						_ = vc.CheckReusable()
 						_ = vc.Snapshot()
 						_ = vc.Err()
 						ch, cancel := vc.WatchClose()

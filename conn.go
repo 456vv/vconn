@@ -32,7 +32,8 @@
 // Status 是唯一的「连接结论」类型，一个字节同时表达「类别」与「是否还有未读数据」。
 // 探测与错误共用同一套常量，调用方只需要学一个枚举：
 //
-//   - Check / CheckBlocking 返回 (Status, error)，CheckReusable 直接给出池化判定，
+//   - Check / CheckBlocking / CheckReusable 都只返回 error（nil ⟺ 存活且干净），
+//     具体结论用 StatusOf(err) 取，CheckReusable 额外满足 errors.Is(err, ErrNotReusable)；
 //     Snapshot() 给出不探测的纯快照（永不会宣称「存活」），
 //     StatusOf(err) 把任意错误归到同一个 Status（Read / Write / CloseNotify / Check*
 //     的错误空间共用同一套答案，一个 switch 就够）。
@@ -57,7 +58,8 @@
 //     保证 Err() / IsPeerClosed() / CloseNotify() 三者一致；
 //     其中 probeReadableHangup 以 ErrPeerClosedWithUnread 落定 closeErr
 //     （该错误 Unwrap 到 io.EOF，且不得从 Read 返回）。
-//     探测只有一份实现（Conn.probe），其它方法都是它的视图；
+//     探测只有一份实现（Conn.probe 取数 + Conn.settleProbe 归类），
+//     其它方法都是它的视图；
 //  5. 探测阶段读走的 SO_ERROR 会保存到 closeErr，上层 Read 不会把 ECONNRESET 降级为 io.EOF；
 //     带 cause 的 ErrPeerClosedWithUnread 同理（见 terminalReadErr）；
 //  6. 已经从内核读出的字节只允许追加进预读缓冲区，任何情况下不得裁剪（裁剪即丢数据）；
@@ -233,16 +235,20 @@ type closeSignal struct {
 	once sync.Once
 }
 
-// notifyKind 通知来源，决定是否把连接标记为"对端已断开"（peerDown）
+// notifyKind 通知来源，只回答一个问题：这次落定是否代表「对端已断开」（peerDown）。
+//
+// 观测上只有两种：本地发起（Close / RawConn / CancelNotify / 上下文取消）
+// 与对端发起（探测结论 / 读写错误）。区分它们的原因只有一个 ——
+// 只有后者才把连接标记为 peerDown，从而影响 IsPeerClosed / Status.PeerDown()
+// 与 ResetNotify 的安全边界。
 type notifyKind uint8
 
 const (
-	// kindLocal 本地主动关闭（Close / RawConn）：不代表对端断开
+	// kindLocal 本地发起的落定（Close / RawConn / CancelNotify / WithContext）：
+	// 不代表对端断开，不改写 peerDown。
 	kindLocal notifyKind = iota
-	// kindRemote 对端断开或网络异常（探测/读写错误）
+	// kindRemote 对端断开或网络异常（探测/读写错误）：落定 peerDown。
 	kindRemote
-	// kindManual 用户手动分发（CancelNotify / WithContext 取消）：不代表对端断开
-	kindManual
 )
 
 // newCloseSignal 创建一个订阅者实例（ch 缓冲 1，尚未投递任何错误）
@@ -733,18 +739,12 @@ func (c *Conn) WatchClose() (<-chan error, func()) {
 	cancel := func() {
 		once.Do(func() {
 			c.mu.Lock()
-			if _, ok := c.signals[sig]; ok {
-				// 必须按订阅者指针删除。c.signals[sig] 的值是空结构体，
-				// 既不是 map 的 key，删它也会在多个订阅者并存时删错人。
-				delete(c.signals, sig)
-				c.mu.Unlock()
-				sig.discard()
-				return
-			}
+			delete(c.signals, sig)
 			c.mu.Unlock()
 			sig.discard()
 		})
 	}
+
 	return sig.ch, cancel
 }
 
@@ -762,7 +762,7 @@ func (c *Conn) CancelNotify(err error) bool {
 	if err == nil {
 		err = ErrNotifyCanceled
 	}
-	return c.notifyClose(err, kindManual)
+	return c.notifyClose(err, kindLocal)
 }
 
 // ResetNotify 清除已落定的关闭通知状态，使连接可以再次被订阅并再次收到通知。
@@ -860,7 +860,7 @@ func (c *Conn) WithContext(ctx context.Context) {
 			if err == nil {
 				err = ErrNotifyCanceled
 			}
-			c.notifyClose(err, kindManual)
+			c.notifyClose(err, kindLocal)
 		}
 	}()
 }
@@ -896,7 +896,8 @@ func (c *Conn) notifyRemote(err error) bool {
 //
 // kind 决定是否把连接标记为 peerDown：
 //   - kindRemote：对端断开/网络异常 → peerDown=true；
-//   - kindLocal / kindManual：只落定通知，不改写"对端是否断开"的事实。
+//   - kindLocal：本地发起的落定（Close / RawConn / CancelNotify / 上下文取消），
+//     只落定通知，不改写"对端是否断开"的事实。
 //
 // 本方法只分发通知，不关闭底层连接：关闭始终是调用方的责任（保持 net.Conn
 // 的半关闭语义，对端 FIN 后仍可写入响应）。需要「通知即关闭」时由调用方写
@@ -1238,6 +1239,17 @@ func (c *Conn) CloseRead() error {
 	return ErrUnsupported
 }
 
+// SetNoDelay 设置 TCP_NODELAY。
+func (c *Conn) SetNoDelay(enable bool) error {
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	if s, ok := c.rwc.(interface{ SetNoDelay(bool) error }); ok {
+		return s.SetNoDelay(enable)
+	}
+	return ErrUnsupported
+}
+
 // probePeekAware 在内核探测之上，把「内核队列已空、但 vconn 自己的预读缓冲
 // 里还有未交付字节」的 probeClosed 归一为 probeReadableHangup。
 //
@@ -1254,9 +1266,11 @@ func (c *Conn) probePeekAware() (probeResult, error) {
 
 // ==================== 健康检查 ====================
 
-// probe 是连接状态探测的唯一实现：
-// Check / CheckBlocking / CheckReusable
-// 全部由它派生，保证「同一结论只有一份映射逻辑」。
+// probe 是连接状态探测的唯一入口：
+// Check / CheckBlocking / CheckReusable 全部由它派生。
+//
+// 两条取数路径（内核探测 / 阻塞预读兜底）只负责「拿到 probeResult」，
+// 归类、落定与 unread 叠加统一交给 settleProbe —— 同一结论只有一份映射逻辑。
 //
 // block=true 时，若内核探测不可用（probeUnsupported：net.Pipe、未知 wrapper
 // 等拿不到 fd 的连接），退化为一次带 peekTimeout（2ms）超时的阻塞预读；
@@ -1276,27 +1290,63 @@ func (c *Conn) probe(block bool) (Status, error) {
 		return StatusLocalClosed, net.ErrClosed
 	}
 
-	res, err := c.checkKernel()
-	switch res {
-	case probeClosed:
-		if c.closed.Load() {
-			return StatusLocalClosed, net.ErrClosed
-		}
-		if err == nil {
-			err = io.EOF
-		}
-		err = c.recordProbe(err)
-		return peerState(err, c.r.hasPeek()), err
+	// 路径一：内核探测（零消耗；能拿到 fd 时总是走这条）。
+	if res, err := c.checkKernel(); res != probeUnsupported {
+		return c.settleProbe(res, err)
+	}
 
-	case probeReadableHangup:
+	// 路径二：内核探测不可用（拿不到 fd / 非 socket）。
+	if !block {
+		return StatusUnverified, nil
+	}
+	// 顺序敏感：!block 必须排在 hasPeek 之前，否则无 fd 连接上的 Check()
+	// 会从「无法验证」变成「有数据待读」。
+	if c.r.hasPeek() {
+		return StatusDataPending, nil
+	}
+	size := c.peekProbeBudget()
+	if size == 0 {
+		// 用户显式关闭了预读，或处于丢弃模式：不能吞数据 → 无法验证。
+		return StatusUnverified, nil
+	}
+
+	pres, perr := c.r.peekProbeStrict(size)
+	if pres == probeUnsupported {
+		// 阻塞探测也没能给出答案（连接不支持 deadline / 前台正在读 / 本地已关闭）。
 		if c.closed.Load() {
 			return StatusLocalClosed, net.ErrClosed
 		}
-		if err == nil {
-			err = peerClosedWithUnreadError{}
+		return StatusUnverified, nil
+	}
+	return c.settleProbe(pres, perr)
+}
+
+// settleProbe 把一次探测结论并入状态机并映射为 Status。
+//
+// 两条取数路径共用本函数，是「探测只有一份分类逻辑」的落点：
+// 它同时负责 recordProbe（落定 peerDown / closeErr / 分发通知）与 unread 位叠加。
+//
+// res 只允许 probeClosed / probeReadableHangup / probeReadable / probeIdle；
+// probeUnsupported 由 probe 在调用前分流。
+func (c *Conn) settleProbe(res probeResult, perr error) (Status, error) {
+	switch res {
+	case probeClosed, probeReadableHangup:
+		// Close 可能与探测并发：本地已关闭时以本地结论为准。
+		if c.closed.Load() {
+			return StatusLocalClosed, net.ErrClosed
 		}
-		err = c.recordProbe(err)
-		return peerState(err, true), err
+		unread := res == probeReadableHangup
+		if perr == nil {
+			// 缺省原因：队列读空的 FIN 用 io.EOF；
+			// 有数据 + 挂断用哨兵（它同时满足 io.EOF 与 ErrPeerClosedWithUnread）。
+			if unread {
+				perr = peerClosedWithUnreadError{}
+			} else {
+				perr = io.EOF
+			}
+		}
+		perr = c.recordProbe(perr)
+		return peerState(perr, unread || c.r.hasPeek()), perr
 
 	case probeReadable:
 		// 存活且有数据：对「探活」是活，对「复用」是脏（由 CheckReusable 判定）。
@@ -1309,74 +1359,34 @@ func (c *Conn) probe(block bool) (Status, error) {
 		return StatusAlive, nil
 	}
 
-	// probeUnsupported：内核探测不可用（拿不到 fd / 非 socket）。
-	if !block {
-		return StatusUnverified, nil
-	}
-	if c.r.hasPeek() {
-		return StatusDataPending, nil
-	}
-	size := c.peekProbeBudget()
-	if size == 0 {
-		// 用户显式关闭了预读，或处于丢弃模式：不能吞数据 → 无法验证。
-		return StatusUnverified, nil
-	}
-
-	switch res, cerr := c.r.peekProbeStrict(size); res {
-	case probeClosed:
-		if c.closed.Load() {
-			return StatusLocalClosed, net.ErrClosed
-		}
-		if cerr == nil {
-			cerr = io.EOF
-		}
-		cerr = c.recordProbe(cerr)
-		return peerState(cerr, c.r.hasPeek()), cerr
-
-	case probeReadableHangup:
-		if c.closed.Load() {
-			return StatusLocalClosed, net.ErrClosed
-		}
-		if cerr == nil {
-			cerr = peerClosedWithUnreadError{}
-		}
-		cerr = c.recordProbe(cerr)
-		return peerState(cerr, true), cerr
-
-	case probeReadable:
-		return StatusDataPending, nil
-
-	case probeIdle:
-		if c.r.hasPeek() {
-			return StatusDataPending, nil
-		}
-		return StatusAlive, nil
-	}
-
-	// 阻塞探测也没能给出答案（连接不支持 deadline / 前台正在读 / 本地已关闭）。
-	if c.closed.Load() {
-		return StatusLocalClosed, net.ErrClosed
-	}
+	// 防御性兜底：res 只可能取上面四个值。
 	return StatusUnverified, nil
 }
 
 // Check 探测连接状态：非阻塞、零消耗（net.Pipe 等无 fd 连接除外）、不关闭连接。
 //
-// 返回值：
+// 唯一返回载体是 error，nil ⟺ StatusAlive：
 //
-//	StatusAlive                存活且当前无数据（已确认）
-//	StatusDataPending          存活，但有未读数据
-//	StatusPeerClosed(±Unread)  对端已结束；带 Unread 时数据仍可读，先 drain 再收尾
-//	StatusPeerReset(±Unread)   对端异常中断（RST/EPIPE/网络故障）
-//	StatusLocalClosed          本地已 Close / RawConn 提取
-//	StatusUnverified           无法判定（内核探测不可用）—— **不是死亡**
+//	StatusOf(err) == StatusAlive               存活且当前无数据（err == nil）
+//	StatusOf(err) == StatusDataPending         存活，但有未读数据（不是故障）
+//	StatusOf(err) == StatusPeerClosed(±Unread) 对端已结束；带 Unread 时先 drain 再收尾
+//	StatusOf(err) == StatusPeerReset(±Unread)  对端异常中断（RST/EPIPE/网络故障）
+//	StatusOf(err) == StatusLocalClosed         本地已 Close / RawConn 提取
+//	StatusOf(err) == StatusUnverified          无法判定（**不是死亡**）
+//
+// 重要：err != nil **不代表连接坏了**。StatusDataPending / StatusUnverified
+// 都是「有话说但连接未必坏」。处置请用 StatusOf(err).Terminal() / .Retryable()，
+// 或 errors.As 出 StatusError 后调同名谓词。
 //
 // 副作用边界：不消耗数据、不丢数据、不关闭底层连接；终结类结论会并入状态机
 // 并分发关闭通知（与监控协程结论一致）。
 //
 // 与 CheckReusable 的区别：本方法回答「活着吗」，StatusDataPending 对探活是活；
 // 池化判定要的是「能不能交给下一个人」，请用 CheckReusable。
-func (c *Conn) Check() (Status, error) { return c.probe(false) }
+func (c *Conn) Check() error {
+	st, err := c.probe(false)
+	return newResult(st, err)
+}
 
 // CheckBlocking 同 Check，但在内核探测不可用时退化为一次带 2ms 超时的阻塞预读。
 //
@@ -1391,7 +1401,10 @@ func (c *Conn) Check() (Status, error) { return c.probe(false) }
 // 这是「现在没法判定」，不是「连接已死」，也不是可复用证明。
 // 包装型连接（实现了 NetConn，且没有显式声明 SafeBlockProber）同样跳过阻塞读，
 // 避免提前 Read 破坏 TLS 记录或吞掉多路复用帧。
-func (c *Conn) CheckBlocking() (Status, error) { return c.probe(true) }
+func (c *Conn) CheckBlocking() error {
+	st, err := c.probe(true)
+	return newResult(st, err)
+}
 
 // checkKernel 执行内核级健康检查，供 probe 共用。
 // CheckReusable 不直接调用它，而是走 probe(true)，从而在拿不到 fd 时还能退化为阻塞预读。
@@ -1454,6 +1467,198 @@ func (c *Conn) peekProbeBudget() int {
 		return v
 	}
 	return defaultPeekSize
+}
+
+// ==================== 纯快照 ====================
+
+// Snapshot 返回连接「已确定的结论」快照：不探测、不落定、不产生通知。
+//
+// 可达集合（除 ResetNotify 外只增不减，因此过期是安全的）：
+//
+//	StatusLocalClosed / StatusPeerClosed(±WithUnread) / StatusPeerReset(±WithUnread) /
+//	StatusLatched / StatusDataPending / StatusUnverified
+//
+// 它**不会**返回 StatusAlive：缓存无法证明「对端还活着」，那需要一次探测
+// （Check / CheckBlocking）。这正是本方法安全的原因——过期的「已结束」仍然是真的，
+// 而过期的「存活」可能是假的。
+func (c *Conn) Snapshot() Status {
+	if c.closed.Load() || c.rawUsed.Load() {
+		return StatusLocalClosed
+	}
+
+	c.mu.Lock()
+	down, notified, cerr := c.peerDown, c.notified.Load(), c.closeErr
+	c.mu.Unlock()
+
+	if down {
+		// 锁外取读，避免 c.mu → peekMu 的嵌套（虽然当前锁序安全，但不必制造约束）
+		return peerState(cerr, c.r.hasPeek())
+	}
+	if notified {
+		// CancelNotify / WithContext 取消：连接未必坏，但通知已落定。
+		return StatusLatched
+	}
+	if c.r.hasPeek() {
+		return StatusDataPending
+	}
+	return StatusUnverified
+}
+
+// ==================== 分类核心 ====================
+
+// isCleanPeerClose 判断探测给出的结束原因是否为「干净的 FIN」。
+//
+// 这是全包唯一判定「干净 FIN」的地方，三处依赖它，判定必须只有一份：
+//   - probePeekAware：只有干净 FIN 才允许把 probeClosed 升级为 probeReadableHangup；
+//   - peerState（下方）：干净 FIN → StatusPeerClosed，否则 StatusPeerReset；
+//   - StatusOf（kind.go）：异常原因必须归到 StatusPeerReset，而不是 StatusPeerClosed。
+//
+// 判定规则 = StatusOf 判为「对端正常结束」**且**不带真实 cause：
+// 带 cause 的哨兵（peerClosedWithUnreadError{cause: ECONNRESET}）虽然 Unwrap 里含
+// io.EOF，但真实原因可能是 RST，抹成「正常收尾」会让上层对非幂等请求做出错误推断。
+func isCleanPeerClose(err error) bool {
+	if err == nil {
+		return true
+	}
+	if StatusOf(err).Class() != StatusPeerClosed {
+		return false
+	}
+	var causer interface{ Cause() error }
+	if errors.As(err, &causer) && causer.Cause() != nil {
+		return false
+	}
+	return true
+}
+
+// peerState 把「对端结束」的原因归类为干净 FIN（StatusPeerClosed）或异常中断（StatusPeerReset），
+// 并叠加 unread 修饰位。
+//
+// 分类不在这里做第二遍：类别取自 StatusOf（唯一映射表），本函数只做两件事——
+//
+//  1. 把类别**收窄**到「对端结束」这两个值。原因无法归类（StatusUnknown：
+//     自定义错误、平台未收录的 errno）时保守报 StatusPeerReset ——
+//     「对端已经没了，但为什么不知道」按异常处理，绝不上报 StatusPeerClosed
+//     让上层误以为请求已执行完；
+//  2. 叠加 unread 位（数据可能在内核队列，也可能在 vconn 的预读缓冲）。
+func peerState(err error, unread bool) Status {
+	st := StatusOf(err).Class()
+	switch st {
+	case StatusPeerClosed, StatusPeerReset:
+		// 保持 StatusOf 的判定
+	default:
+		st = StatusPeerReset
+	}
+	if unread {
+		st |= flagUnread
+	}
+	return st
+}
+
+// ==================== 复用判定 ====================
+
+// CheckReusable 连接池专用：判断连接能否交给下一个使用者。
+//
+// 返回 nil 当且仅当 Status == StatusAlive（存活、干净、无延迟错误、
+// 无落定通知、读取配额未耗尽）。失败时：
+//
+//   - errors.Is(err, ErrNotReusable) 恒成立；
+//
+//   - StatusOf(err) 一步给出分类（StatusDataPending / StatusBusy / StatusUnverified /
+//     StatusLatched / StatusPeerClosed / StatusPeerReset / StatusLocalClosed / StatusQuota）。
+//
+//     if err := c.CheckReusable(); err != nil {
+//     st := vconn.StatusOf(err)
+//     metrics.Drop(st.String(), st)
+//     if st.Terminal() {
+//     _ = c.Close()
+//     }
+//     return err // 换一条连接重试
+//     }
+//
+// 判定顺序是故意从便宜到贵：本地关闭、前台占用、遗留错误、已落定通知、
+// 读取配额，最后才做一次探测。前面任何一步失败都不再碰 socket。
+//
+// 约束（务必遵守，否则判定会失真）：
+//   - 只能在空闲连接上调用：需要「没有其它 goroutine 正在 Read/Write」。
+//     前台正持有读锁时返回 StatusBusy，而不是猜测连接死活；
+//   - 不关闭连接，也不修改调用方的 ReadDeadline；
+//   - 有 fd 时零消耗（SO_ERROR + poll + MSG_PEEK），无 fd 时可能读 1 字节进预读缓冲
+//     （探测额度见 SetBackgroundReadBuffer；显式设为 0 或负值时不探测，返回 ErrUnverified）；
+//   - 不适用于 server-speaks-first / 推送型协议（它们天然有未读数据，恒判 StatusDataPending）；
+//   - 池里的连接不要开 SetBackgroundReadBuffer(>0)，预读字节会被判脏；
+//   - 用 NewData 交接进来的字节同样会被判脏；
+//   - TLS 内部缓冲不可见，只能尽力而为；业务仍需支持换连接重试。
+func (c *Conn) CheckReusable() error {
+	st, err := c.checkReusable()
+	return newResult(st, err)
+}
+
+// checkReusable 是 CheckReusable 的实现，保留旧的 (Status, error) 形态：
+// 探测与分类逻辑不变，只有公开边界由 newResult 折叠成单一 error。
+func (c *Conn) checkReusable() (Status, error) {
+	if c.closed.Load() || c.rawUsed.Load() {
+		return StatusLocalClosed, notReusable(net.ErrClosed)
+	}
+
+	// 1. 延迟错误（含 TLS close_notify）：下一次 Read 会立刻吐出来。
+	pending, idle := c.r.pendingError()
+	if !idle {
+		return StatusBusy, notReusable(ErrBusy)
+	}
+	if pending != nil {
+		return peerState(pending, c.r.hasPeek()), notReusable(pending)
+	}
+
+	// 2. 已落定的手动/上下文通知，未 ResetNotify 前不可复用。
+	if c.notified.Load() && !c.IsPeerClosed() {
+		return StatusLatched, notReusable(ErrNotifyLatched)
+	}
+
+	// 3. 读取配额耗尽：下一次 Read 直接 EOF。
+	if c.r.readLimit.Load() == 0 {
+		return StatusQuota, notReusable(ErrQuota)
+	}
+
+	// 4. 已落定的断开结论：直接复用结论，避免重复探测与原因漂移。
+	if down, cerr := c.latchedPeer(); down {
+		return peerState(cerr, c.r.hasPeek()), notReusable(cerr)
+	}
+
+	// 5. 探测（唯一实现；block=true 让无 fd 的连接也能退化到阻塞预读）。
+	st, err := c.probe(true)
+
+	switch st.Class() {
+	case StatusAlive:
+		return st, nil
+	case StatusDataPending:
+		return st, notReusable(ErrDataPending)
+	case StatusUnverified:
+		return st, notReusable(ErrUnverified)
+	case StatusBusy:
+		return st, notReusable(ErrBusy)
+	case StatusLocalClosed:
+		return st, notReusable(net.ErrClosed)
+	default: // StatusPeerClosed / StatusPeerReset（含 +unread 变体）
+		if err == nil {
+			err = io.EOF
+		}
+		return st, notReusable(err)
+	}
+}
+
+// latchedPeer 读取已落定的「对端已断开」结论（连接级，first-wins）。
+func (c *Conn) latchedPeer() (bool, error) {
+	c.mu.Lock()
+	down, err := c.peerDown, c.closeErr
+	c.mu.Unlock()
+
+	if !down {
+		return false, nil
+	}
+	if err == nil {
+		err = io.EOF
+	}
+	return true, err
 }
 
 // ReaderFrom 未实现：预读缓冲区语义与 io.ReaderFrom 不兼容，故不提供该方法，

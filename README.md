@@ -62,18 +62,17 @@ go func() {
 ### 连接是不是已经结束
 
 ```go
-st, err := c.Check() // 非阻塞，不消耗字节
+err := c.Check()             // 非阻塞，不消耗字节
+st := vconn.StatusOf(err)    // 完整结论（含 unread 修饰位）
 switch st.Class() {
 case vconn.StatusAlive:
-    // 已确认存活，当前没有待读数据
+    // 已确认存活，当前没有待读数据（此时 err == nil）
 case vconn.StatusDataPending:
     // 还活着，但已经有数据。对探活来说是活的，对连接池来说是脏的
 case vconn.StatusPeerClosed:
-    // 干净结束，接收队列已空
-case vconn.StatusPeerClosedWithUnread:
-    // 干净结束，但仍有数据：先读完
-case vconn.StatusPeerReset, vconn.StatusPeerResetWithUnread:
-    // RST、断网、对端异常中止
+    // 干净结束。st.Unread() 为真说明接收队列里还有数据：先读完再收尾
+case vconn.StatusPeerReset:
+    // RST、断网、对端异常中止。st.Unread() 同上
 case vconn.StatusLocalClosed:
     // 本端 Close，或原始连接已被取走
 case vconn.StatusUnverified:
@@ -81,20 +80,21 @@ case vconn.StatusUnverified:
 }
 ```
 
+`Check*` 只返回一个 `error`：`nil` 当且仅当 `StatusAlive`，其余结论都装在错误里，用 `StatusOf(err)` 取出。所以 `err != nil` 不等于连接坏了——`StatusDataPending` / `StatusUnverified` / `StatusBusy` 都是「有话说」。
+
 `CheckBlocking` 与 `Check` 的结论空间相同。差别只在拿不到 fd 时：前者会在确认读取安全后，用 2ms 超时读 1 字节；后者直接返回 `StatusUnverified`。
 
 ### 能不能放回连接池
 
 ```go
-st, err := c.CheckReusable()
-if err != nil {
+if err := c.CheckReusable(); err != nil {
     // err 一定满足 errors.Is(err, vconn.ErrNotReusable)
-    log.Printf("丢弃连接: status=%s class=%s err=%v",
-        st, vconn.StatusOf(err), err)
+    st := vconn.StatusOf(err)
+    log.Printf("丢弃连接: status=%s class=%s err=%v", st, st.Class(), err)
     c.Close()
     return nil
 }
-pool.Put(c) // 此时 st 一定是 StatusAlive
+pool.Put(c) // 走到这里说明连接干净存活（err == nil ⟺ StatusAlive）
 ```
 
 `CheckReusable` 比 `Check` 更严。有残留数据、前台正在读、通知已锁存、读配额耗尽、无法验证，全部不能复用。
@@ -170,8 +170,7 @@ type Statuser interface {
 - `Reusable()` 只在 `StatusAlive` 时为真，并且可复用一定还可读；
 - `Ended()` 只包含对端结束和本端关闭；
 - `Terminal()` 比 `Ended()` 多两个：有残留数据、读配额用尽。连接可能还活着，但不能再交给别人；
-- `PeerDown()` 只看对端，本端 `Close` 不算；
-- `Retryable()` 表示换连接或稍后重试有意义，不表示这次请求一定没有执行。
+- `PeerDown()` 只看对端，本端 `Close` 不算。
 
 `Snapshot()` 不探测。它只报告已经确定的事实，所以**永远不返回 `StatusAlive`**：一份缓存证明不了对端现在还活着。已知结束时用它可以省掉一次系统调用；要肯定「还活着」，调用 `Check`。
 

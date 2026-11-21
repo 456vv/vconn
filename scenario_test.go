@@ -44,8 +44,8 @@ func TestScenario_RequestResponse(t *testing.T) {
 	if !vc.Snapshot().Ended() {
 		t.Fatalf("Snapshot 应报告 Ended，得到 %v", vc.Snapshot())
 	}
-	if st, rerr := vc.CheckReusable(); st.Class() != StatusPeerClosed || !errors.Is(rerr, ErrNotReusable) {
-		t.Fatalf("CheckReusable 应判定不可复用，得到 (%v, %v)", st, rerr)
+	if err := vc.CheckReusable(); StatusOf(err).Class() != StatusPeerClosed || !errors.Is(err, ErrNotReusable) {
+		t.Fatalf("CheckReusable 应判定不可复用，得到 (%v, %v)", StatusOf(err), err)
 	}
 
 	// 数据完整可读，读空后是裸 io.EOF
@@ -73,7 +73,7 @@ func TestScenario_PoolReuse(t *testing.T) {
 		defer srv.Close()
 		defer vc.Close()
 
-		st, err := vc.CheckReusable()
+		st, err := splitProbe(vc.CheckReusable())
 		if st != StatusAlive || err != nil {
 			t.Fatalf("干净连接应可复用，得到 (%v, %v)", st, err)
 		}
@@ -89,7 +89,7 @@ func TestScenario_PoolReuse(t *testing.T) {
 		defer vc.Close()
 
 		vc.r.pushPeek([]byte("leftover"))
-		st, err := vc.CheckReusable()
+		st, err := splitProbe(vc.CheckReusable())
 		if st != StatusDataPending || !errors.Is(err, ErrDataPending) || !st.Terminal() {
 			t.Fatalf("脏连接应判定丢弃，得到 (%v, %v)", st, err)
 		}
@@ -102,14 +102,14 @@ func TestScenario_PoolReuse(t *testing.T) {
 		defer vc.Close()
 
 		vc.CancelNotify(nil)
-		if st, err := vc.CheckReusable(); st != StatusLatched || !errors.Is(err, ErrNotifyLatched) {
+		if st, err := splitProbe(vc.CheckReusable()); st != StatusLatched || !errors.Is(err, ErrNotifyLatched) {
 			t.Fatalf("应为 StatusLatched，得到 (%v, %v)", st, err)
 		}
 		if err := vc.ResetNotify(false); err != nil {
 			t.Fatalf("ResetNotify: %v", err)
 		}
-		if st, err := vc.CheckReusable(); st != StatusAlive || err != nil {
-			t.Fatalf("重置后应可复用，得到 (%v, %v)", st, err)
+		if err := vc.CheckReusable(); err != nil {
+			t.Fatalf("重置后应可复用，得到 %v", err)
 		}
 	})
 }

@@ -32,8 +32,8 @@ func TestSyscallConnOf(t *testing.T) {
 
 		vc := New(c)
 		defer vc.Close()
-		if st, err := vc.Check(); err != nil || st.Class() != StatusUnverified {
-			t.Fatalf("Check 应 fail-open 为 StatusUnverified，得到 (%v, %v)", st, err)
+		if err := vc.Check(); StatusOf(err).Class() != StatusUnverified {
+			t.Fatalf("Check 应 fail-open 为 StatusUnverified，得到 %v", err)
 		}
 	})
 
@@ -51,8 +51,8 @@ func TestSyscallConnOf(t *testing.T) {
 	})
 }
 
-// TestProbe_ResolvePeekBlock 预读策略表
-func TestProbe_ResolvePeekBlock(t *testing.T) {
+// TestProbe_ResolvePeekSkip 预读策略表
+func TestProbe_ResolvePeekSkip(t *testing.T) {
 	wrap, wrapPeer := pipePair()
 	defer wrapPeer.Close()
 	direct := &directConn{Conn: wrap}
@@ -63,21 +63,22 @@ func TestProbe_ResolvePeekBlock(t *testing.T) {
 		res        probeResult
 		allowBlock bool
 		wantSkip   bool
-		wantBlock  bool
 	}{
-		{"可读/直接", direct, probeReadable, false, false, false},
-		{"可读/包装", wrap, probeReadable, true, true, false},
-		{"空闲/直接/允许阻塞", direct, probeIdle, true, false, true},
-		{"空闲/直接/不允许", direct, probeIdle, false, true, false},
-		{"空闲/包装", wrap, probeIdle, true, true, false},
-		{"不支持/叶子", wrap, probeUnsupported, false, false, true},
+		{"可读/直接", direct, probeReadable, false, false},
+		{"可读/包装", wrap, probeReadable, true, true},
+		{"可读挂断/直接", direct, probeReadableHangup, false, false},
+		{"可读挂断/包装", wrap, probeReadableHangup, true, true},
+		{"空闲/直接/允许阻塞", direct, probeIdle, true, false},
+		{"空闲/直接/不允许", direct, probeIdle, false, true},
+		{"空闲/包装", wrap, probeIdle, true, true},
+		{"不支持/叶子", wrap, probeUnsupported, false, false},
+		{"不支持/不可阻塞", noProbeConn{Conn: wrap}, probeUnsupported, false, true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			skip, block := resolvePeekBlock(tc.c, tc.res, tc.allowBlock)
-			if skip != tc.wantSkip || block != tc.wantBlock {
-				t.Fatalf("got (skip=%v, block=%v), want (%v, %v)", skip, block, tc.wantSkip, tc.wantBlock)
+			if got := resolvePeekSkip(tc.c, tc.res, tc.allowBlock); got != tc.wantSkip {
+				t.Fatalf("resolvePeekSkip = %v, want %v", got, tc.wantSkip)
 			}
 		})
 	}

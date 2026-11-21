@@ -103,33 +103,32 @@ func TestStatusOf_CustomStatuser(t *testing.T) {
 
 // statusRow 是某个 Status 取值的完整行为契约（观测轴 + 处置轴）
 type statusRow struct {
-	st        Status
-	str       string
-	readable  bool
-	reusable  bool
-	ended     bool
-	unread    bool
-	retryable bool
-	terminal  bool
-	errOnly   bool
+	st       Status
+	str      string
+	readable bool
+	reusable bool
+	ended    bool
+	unread   bool
+	terminal bool
+	errOnly  bool
 }
 
 var statusRows = []statusRow{
-	{StatusAlive, "alive", true, true, false, false, false, false, false},
-	{StatusDataPending, "data-pending", true, false, false, false, false, true, false},
-	{StatusPeerClosed, "peer-closed", false, false, true, false, true, true, false},
-	{StatusPeerClosedWithUnread, "peer-closed+unread", true, false, true, true, true, true, false},
-	{StatusPeerReset, "peer-reset", false, false, true, false, true, true, false},
-	{StatusPeerResetWithUnread, "peer-reset+unread", true, false, true, true, true, true, false},
-	{StatusLocalClosed, "local-closed", false, false, true, false, false, true, false},
-	{StatusUnverified, "unverified", false, false, false, false, true, false, false},
-	{StatusBusy, "busy", false, false, false, false, true, false, false},
-	{StatusLatched, "latched", false, false, false, false, false, false, false},
-	{StatusQuota, "quota", false, false, false, false, false, true, false},
-	{StatusTimeout, "timeout", false, false, false, false, true, false, true},
-	{StatusInUse, "in-use", false, false, false, false, false, false, true},
-	{StatusUnsupported, "unsupported", false, false, false, false, false, false, true},
-	{StatusUnknown, "unknown", false, false, false, false, false, false, true},
+	{StatusAlive, "alive", true, true, false, false, false, false},
+	{StatusDataPending, "data-pending", true, false, false, false, true, false},
+	{StatusPeerClosed, "peer-closed", false, false, true, false, true, false},
+	{StatusPeerClosedWithUnread, "peer-closed+unread", true, false, true, true, true, false},
+	{StatusPeerReset, "peer-reset", false, false, true, false, true, false},
+	{StatusPeerResetWithUnread, "peer-reset+unread", true, false, true, true, true, false},
+	{StatusLocalClosed, "local-closed", false, false, true, false, true, false},
+	{StatusUnverified, "unverified", false, false, false, false, false, false},
+	{StatusBusy, "busy", false, false, false, false, false, false},
+	{StatusLatched, "latched", false, false, false, false, false, false},
+	{StatusQuota, "quota", false, false, false, false, true, false},
+	{StatusTimeout, "timeout", false, false, false, false, false, true},
+	{StatusInUse, "in-use", false, false, false, false, false, true},
+	{StatusUnsupported, "unsupported", false, false, false, false, false, true},
+	{StatusUnknown, "unknown", false, false, false, false, false, true},
 }
 
 // TestStatus_Predicates 逐值校验两个轴上的全部谓词
@@ -148,7 +147,6 @@ func TestStatus_Predicates(t *testing.T) {
 				{"Readable", r.st.Readable(), r.readable},
 				{"Reusable", r.st.Reusable(), r.reusable},
 				{"Ended", r.st.Ended(), r.ended},
-				{"Retryable", r.st.Retryable(), r.retryable},
 				{"Terminal", r.st.Terminal(), r.terminal},
 			}
 			for _, c := range checks {
@@ -159,7 +157,7 @@ func TestStatus_Predicates(t *testing.T) {
 			if differs := r.st != r.st.Class(); differs != r.unread {
 				t.Fatalf("%v 的 unread 位与表不符：Class() = %v", r.st, r.st.Class())
 			}
-			if r.st.Class().Retryable() != r.retryable || r.st.Class().Terminal() != r.terminal {
+			if r.st.Class().Terminal() != r.terminal {
 				t.Fatalf("%v 带修饰位时的处置结论与不带修饰时不一致", r.st)
 			}
 		})
@@ -205,7 +203,6 @@ func TestStatus_TableInvariants(t *testing.T) {
 // 内部错误类型必须实现 Statuser
 var (
 	_ Statuser = peerClosedWithUnreadError{}
-	_ Statuser = notReusableError{}
 )
 
 // TestConnIsNotStatuser 钉住命名决策：*Conn 不得实现 Statuser

@@ -198,58 +198,29 @@ func (r *connReader) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
-// resolvePeekBlock 决定本次预读该怎么做。
+// resolvePeekSkip 决定本次后台/探活预读是否必须跳过。
 //
-// 分开「内核已确认可读」和「需要干等一会儿」是为了保护有协议状态的包装连接：
-// TLS、多路复用的 Read 不是纯字节搬运。只有直接持有 fd 的连接，
-// 才能在内核说「有字节」时安全地把原始字节放进预读缓冲。
+// 分开「内核已确认可读」与「需要干等一会儿」，是为了保护有协议状态的包装连接：
+// TLS、多路复用的 Read 不是纯字节搬运，只有直接持有 fd 的连接才能把原始字节
+// 放进预读缓冲。
 //
-// 返回值含义：
+//	probeReadable / probeReadableHangup  直接连接 → 读；包装连接 → 跳过
+//	                                     （读到的是密文/帧，会破坏记录边界）
+//	probeIdle                            直接连接且 allowBlock → 读（等待型探测）；
+//	                                     其它 → 跳过（没有可观察的就绪事件）
+//	probeUnsupported                     isBlockProbeSafe → 读；其它 → 跳过（安全优先）
 //
-//	skip=true               → 本次不读，调用方直接返回 (false, nil)
-//	skip=false, block=true  → 读（等待型探测）
-//	skip=false, block=false → 读（内核已确认可读）
-//
-// 注意：block 不再是"要不要设超时"的开关 —— 所有后台/探活读一律带自身超时
-// （poll 与 Read 之间数据可能被前台读消费，无超时的 Read 会永久阻塞并占用 fg）。
-// block 仅用于表达"本次是否属于等待型探测"的语义。
-//
-// 四种探测结果的处理规则：
-//
-//	probeReadable（有数据可读）
-//	  直接连接（*net.TCPConn 等）      → 读
-//	  非直接连接（*tls.Conn 等包装）   → 跳过（读到的是密文，会破坏 TLS 记录边界）
-//
-//	probeReadableHangup（有数据 + 对端已 FIN）
-//	  同 probeReadable：数据可读且必须可读，跳过会让数据卡在内核里
-//
-//	probeIdle（无数据但连接存活）
-//	  直接连接 + 允许阻塞              → 读（等待型探测）
-//	  其它                             → 跳过（没有可观察的就绪事件）
-//
-//	probeUnsupported（拿不到 fd，无法内核探测）
-//	  isBlockProbeSafe(c)              → 读（等待型探测）
-//	    · 直接 syscall.Conn / 叶子连接（net.Pipe、内存管道）
-//	    · 显式实现 SafeBlockProber 并返回 true
-//	  其它（包装型连接，如 TLS wrapper）→ 跳过（安全优先）
-func resolvePeekBlock(c net.Conn, res probeResult, allowBlock bool) (skip, block bool) {
+// 所有预读一律带自身超时（poll 与 Read 之间数据可能被前台读消费，无超时的 Read
+// 会永久阻塞并占住 fg），因此这里不需要「是否设超时」的开关。
+func resolvePeekSkip(c net.Conn, res probeResult, allowBlock bool) bool {
 	direct := isDirectSyscallConn(c)
 	switch res {
 	case probeReadable, probeReadableHangup:
-		if !direct {
-			return true, false
-		}
-		return false, false
+		return !direct
 	case probeIdle:
-		if !direct || !allowBlock {
-			return true, false
-		}
-		return false, true
+		return !direct || !allowBlock
 	default: // probeUnsupported
-		if isBlockProbeSafe(c) {
-			return false, true
-		}
-		return true, false
+		return !isBlockProbeSafe(c)
 	}
 }
 
@@ -287,9 +258,8 @@ func (r *connReader) peekStep(stop <-chan struct{}, res probeResult, allowBlock 
 		want -= have
 	}
 
-	skip, _ := resolvePeekBlock(r.conn.rwc, res, allowBlock)
-	if skip {
-		// 表示不用预读
+	if resolvePeekSkip(r.conn.rwc, res, allowBlock) {
+		// 没有可观察的就绪事件，或该连接不能安全地提前读
 		return false, nil
 	}
 
@@ -357,9 +327,10 @@ func (r *connReader) peekProbeStrict(size int) (probeResult, error) {
 		}
 	}
 
-	if skip, _ := resolvePeekBlock(r.conn.rwc, probeUnsupported, true); skip {
+	if resolvePeekSkip(r.conn.rwc, probeUnsupported, true) {
 		return probeUnsupported, nil
 	}
+
 	if !r.fg.TryLock() {
 		// 前台正在读（或后台预读持锁）：让路，本次无法判定。
 		return probeUnsupported, nil

@@ -54,3 +54,14 @@ func isCommonNetError(err error) bool {
 
 	return false
 }
+
+// syscallErrno 把内核错误码转换为 error（0 表示无错误）。
+//
+// 放在本文件（无构建标签）而不是各平台 errno_*.go：三份实现体完全一致，
+// 而 syscall.Errno 在所有目标平台（含 plan9 / js / wasip1）上都存在。
+func syscallErrno(v int) error {
+	if v == 0 {
+		return nil
+	}
+	return syscall.Errno(v)
+}

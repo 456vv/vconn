@@ -23,11 +23,3 @@ func isNetErrno(errno syscall.Errno) bool {
 	}
 	return false
 }
-
-// syscallErrno 把内核错误码转换为 error
-func syscallErrno(v int) error {
-	if v == 0 {
-		return nil
-	}
-	return syscall.Errno(v)
-}

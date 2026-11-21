@@ -108,8 +108,8 @@ func TestCheck(t *testing.T) {
 		defer srv.Close()
 		defer vc.Close()
 
-		if st, err := vc.Check(); st != StatusAlive || err != nil {
-			t.Fatalf("健康连接应为 (StatusAlive, nil)，得到 (%v, %v)", st, err)
+		if err := vc.Check(); err != nil {
+			t.Fatalf("健康连接应返回 nil（存活且干净），得到 %v", err)
 		}
 		if _, err := srv.Write([]byte("x")); err != nil {
 			t.Fatalf("Check 不应影响底层连接: %v", err)
@@ -122,12 +122,14 @@ func TestCheck(t *testing.T) {
 		defer srv.Close()
 
 		vc.Close()
-		st, err := vc.Check()
+		err := vc.Check()
+		st := StatusOf(err)
 		if st != StatusLocalClosed || !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("应为 (StatusLocalClosed, net.ErrClosed)，得到 (%v, %v)", st, err)
 		}
-		if k := StatusOf(err); k != StatusLocalClosed {
-			t.Fatalf("应归类为 StatusLocalClosed，得到 %v", k)
+		// 单一 error 边界上，结论与原因必须同时可读：Status() 给结论，Cause() 给原因。
+		if StatusOf(err).Class() != StatusLocalClosed || !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("result 应同时暴露结论与原因，得到 %v", err)
 		}
 	})
 
@@ -139,12 +141,16 @@ func TestCheck(t *testing.T) {
 		vc := New(c)
 		defer vc.Close()
 
-		st, err := vc.Check()
-		if st != StatusUnverified || err != nil {
-			t.Fatalf("应为 (StatusUnverified, nil)，得到 (%v, %v)", st, err)
+		st, cause := splitProbe(vc.Check())
+		if st != StatusUnverified {
+			t.Fatalf("应为 StatusUnverified，得到 (%v, %v)", st, cause)
 		}
 		if st.Ended() {
 			t.Fatal("无法验证不等于已结束")
+		}
+		// 「无法判定」不是故障：错误非 nil（它是结论的载体），但不带真实原因。
+		if cause != nil {
+			t.Fatalf("StatusUnverified 不应携带原因，得到 %v", cause)
 		}
 	})
 
@@ -155,7 +161,7 @@ func TestCheck(t *testing.T) {
 		defer vc.Close()
 
 		vc.r.pushPeek([]byte("abc"))
-		st, err := vc.Check()
+		st, err := splitProbe(vc.Check())
 		if st != StatusDataPending || err != nil {
 			t.Fatalf("应为 (StatusDataPending, nil)，得到 (%v, %v)", st, err)
 		}
@@ -245,11 +251,11 @@ func TestCheckBlocking(t *testing.T) {
 		defer vc.Close()
 
 		start := time.Now()
-		st, err := vc.CheckBlocking()
+		err := vc.CheckBlocking()
 		elapsed := time.Since(start)
 
-		if st != StatusAlive || err != nil {
-			t.Fatalf("静默对端应视为存活，得到 (%v, %v)", st, err)
+		if err != nil {
+			t.Fatalf("静默对端应视为存活（nil），得到 %v", err)
 		}
 		if elapsed > 250*time.Millisecond {
 			t.Fatalf("探测过慢: %v", elapsed)
@@ -273,12 +279,8 @@ func TestCheckBlocking(t *testing.T) {
 		defer vc.Close()
 
 		s.Close()
-		st, err := vc.CheckBlocking()
-		if st != StatusPeerClosed {
-			t.Fatalf("阻塞兜底应发现对端关闭，得到 (%v, %v)", st, err)
-		}
-		if StatusOf(err) != StatusPeerClosed {
-			t.Fatalf("应归类为 StatusPeerClosed，得到 %v", StatusOf(err))
+		if err := vc.CheckBlocking(); StatusOf(err) != StatusPeerClosed || !errors.Is(err, io.EOF) {
+			t.Fatalf("阻塞兜底应发现对端关闭，得到 (%v, %v)", StatusOf(err), err)
 		}
 	})
 
@@ -291,8 +293,8 @@ func TestCheckBlocking(t *testing.T) {
 		defer vc.Close()
 		vc.SetBackgroundReadBuffer(0)
 
-		if st, err := vc.CheckBlocking(); st != StatusUnverified || err != nil {
-			t.Fatalf("应为 (StatusUnverified, nil)，得到 (%v, %v)", st, err)
+		if err := vc.CheckBlocking(); StatusOf(err) != StatusUnverified {
+			t.Fatalf("应为 StatusUnverified，得到 %v", err)
 		}
 	})
 
@@ -302,9 +304,9 @@ func TestCheckBlocking(t *testing.T) {
 		defer srv.Close()
 		vc.Close()
 
-		for _, fn := range []func() (Status, error){vc.Check, vc.CheckBlocking} {
-			st, err := fn()
-			if !errors.Is(err, net.ErrClosed) || st.Class() != StatusLocalClosed {
+		for _, fn := range []func() error{vc.Check, vc.CheckBlocking} {
+			err := fn()
+			if st := StatusOf(err); !errors.Is(err, net.ErrClosed) || st.Class() != StatusLocalClosed {
 				t.Fatalf("应为 (StatusLocalClosed, net.ErrClosed)，得到 (%v, %v)", st, err)
 			}
 		}
@@ -350,7 +352,7 @@ func TestCheckReusable(t *testing.T) {
 				tc.setup(t, vc, srv)
 			}
 
-			st, err := vc.CheckReusable()
+			st, err := splitProbe(vc.CheckReusable())
 			if st != tc.want {
 				t.Fatalf("st = %v，期望 %v（err=%v）", st, tc.want, err)
 			}
@@ -378,7 +380,7 @@ func TestCheckReusable(t *testing.T) {
 		defer srv.Close()
 		vc.Close()
 
-		st, err := vc.CheckReusable()
+		st, err := splitProbe(vc.CheckReusable())
 		if st != StatusLocalClosed || !errors.Is(err, net.ErrClosed) || !errors.Is(err, ErrNotReusable) {
 			t.Fatalf("应为 (StatusLocalClosed, net.ErrClosed)，得到 (%v, %v)", st, err)
 		}
@@ -392,7 +394,7 @@ func TestCheckReusable(t *testing.T) {
 		srv.Close()
 		deadline := time.Now().Add(2 * time.Second)
 		for {
-			st, err := vc.CheckReusable()
+			st, err := splitProbe(vc.CheckReusable())
 			if st.Ended() {
 				if !errors.Is(err, ErrNotReusable) || StatusOf(err) != StatusPeerClosed {
 					t.Fatalf("应归类为 StatusPeerClosed，得到 (%v, %v)", st, err)
@@ -418,8 +420,8 @@ func TestSnapshot(t *testing.T) {
 		if st := vc.Snapshot(); st != StatusUnverified {
 			t.Fatalf("未探测过的健康连接快照应为 StatusUnverified，得到 %v", st)
 		}
-		if st, err := vc.Check(); st != StatusAlive || err != nil {
-			t.Fatalf("Check 应为 (StatusAlive, nil)，得到 (%v, %v)", st, err)
+		if err := vc.Check(); err != nil {
+			t.Fatalf("Check 应返回 nil（存活且干净），得到 %v", err)
 		}
 		if st := vc.Snapshot(); st != StatusUnverified {
 			t.Fatalf("探测过也不缓存「存活」，得到 %v", st)
@@ -462,14 +464,19 @@ func TestSnapshot(t *testing.T) {
 
 // TestProbe_NeverReturnsErrorOnlyClasses 探测 API 只返回观测空间的类别。
 //
-// 注意：Go 不允许把多返回值调用当作多参数函数的实参，
-// 因此这里显式拆成两次赋值，而不是 obs("Check", vc.Check())。
+// Check* 只返回一个 error，结论一律经 StatusOf 取出；Snapshot 直接给 Status。
+// 两者共用 obs 断言，保证「探测永不返回错误空间专属类别」。
 func TestProbe_NeverReturnsErrorOnlyClasses(t *testing.T) {
 	obs := func(name string, st Status, err error) {
 		t.Helper()
 		if st.Class() > StatusQuota {
 			t.Fatalf("%s 返回了错误空间专属类别 %v (%v)", name, st, err)
 		}
+	}
+	// check 把 Check* 的单一 error 收敛成 obs 需要的 (Status, error)。
+	check := func(name string, err error) {
+		t.Helper()
+		obs(name, StatusOf(err), err)
 	}
 
 	t.Run("健康TCP", func(t *testing.T) {
@@ -478,12 +485,9 @@ func TestProbe_NeverReturnsErrorOnlyClasses(t *testing.T) {
 		defer srv.Close()
 		defer vc.Close()
 
-		st, err := vc.Check()
-		obs("Check", st, err)
-		st, err = vc.CheckBlocking()
-		obs("CheckBlocking", st, err)
-		st, err = vc.CheckReusable()
-		obs("CheckReusable", st, err)
+		check("Check", vc.Check())
+		check("CheckBlocking", vc.CheckBlocking())
+		check("CheckReusable", vc.CheckReusable())
 		obs("Snapshot", vc.Snapshot(), vc.Err())
 	})
 
@@ -495,10 +499,8 @@ func TestProbe_NeverReturnsErrorOnlyClasses(t *testing.T) {
 		vc := New(c)
 		defer vc.Close()
 
-		st, err := vc.Check()
-		obs("Check", st, err)
-		st, err = vc.CheckBlocking()
-		obs("CheckBlocking", st, err)
+		check("Check", vc.Check())
+		check("CheckBlocking", vc.CheckBlocking())
 		obs("Snapshot", vc.Snapshot(), vc.Err())
 	})
 
@@ -509,8 +511,7 @@ func TestProbe_NeverReturnsErrorOnlyClasses(t *testing.T) {
 		defer vc.Close()
 
 		vc.r.pushPeek([]byte("x"))
-		st, err := vc.Check()
-		obs("Check", st, err)
+		check("Check", vc.Check())
 		obs("Snapshot", vc.Snapshot(), vc.Err())
 	})
 }
@@ -527,7 +528,7 @@ func TestProbe_NoDriftWithProbe(t *testing.T) {
 		vc.r.pending = io.EOF
 		vc.r.fg.Unlock()
 
-		st, err := vc.CheckReusable()
+		st, err := splitProbe(vc.CheckReusable())
 		if st.Class() != StatusPeerClosed || StatusOf(err).Class() != StatusPeerClosed {
 			t.Fatalf("两轴必须一致，得到 (%v, StatusOf=%v)", st, StatusOf(err))
 		}
@@ -543,7 +544,7 @@ func TestProbe_NoDriftWithProbe(t *testing.T) {
 		vc.r.pending = errors.New("boom")
 		vc.r.fg.Unlock()
 
-		st, err := vc.CheckReusable()
+		st, err := splitProbe(vc.CheckReusable())
 		if st.Class() != StatusPeerReset {
 			t.Fatalf("无法归类时应保守报 StatusPeerReset，得到 %v", st)
 		}
@@ -564,8 +565,8 @@ func TestSocketError_Unsupported(t *testing.T) {
 
 	vc := New(c)
 	defer vc.Close()
-	if st, err := vc.Check(); err != nil || st.Class() != StatusUnverified {
-		t.Fatalf("Check 应 fail-open 为 StatusUnverified，得到 (%v, %v)", st, err)
+	if err := vc.Check(); StatusOf(err).Class() != StatusUnverified {
+		t.Fatalf("Check 应 fail-open 为 StatusUnverified，得到 %v", err)
 	}
 }
 

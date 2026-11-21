@@ -1,6 +1,12 @@
 package vconn
 
-import "errors"
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"os"
+)
 
 // Status 是本包唯一的「连接结论」类型：一个字节同时表达两个正交轴——
 //
@@ -11,11 +17,9 @@ import "errors"
 // StatusPeerClosed 的 Class() 相同，调用方不会因为「还有数据」漏进 default。
 // 类别超过 15 个会和 Unread 位重叠，state.go 底部的编译期除法会直接编译失败。
 //
-//	st, err := c.CheckReusable()
-//	if st == vconn.StatusAlive {
-//		reuse()                       // 干净存活，可以交给下一个使用者
-//	}
+//	err := c.CheckReusable()
 //	switch vconn.StatusOf(err) {       // 同一个类型、同一套常量
+//	case vconn.StatusAlive:			   // 干净存活，可以交给下一个使用者
 //	case vconn.StatusPeerClosed:       // 对端正常结束 → 先 drain，幂等请求可重试
 //	case vconn.StatusPeerReset:        // 异常中断 → 换连接；非幂等请求不要重试
 //	case vconn.StatusLocalClosed,
@@ -34,8 +38,10 @@ import "errors"
 //
 // 处置轴（StatusOf(err) 给出的动作建议）：
 //
-//	Retryable() 换一条连接 / 稍后再试有意义吗？
 //	Terminal()  这条连接还能用吗？
+//
+// 「要不要换连接 / 稍后重试」不单独给谓词：Terminal() 为真就换连接，
+// StatusBusy / StatusUnverified 则是「此刻没法判定，退避后再问」。
 //
 // 类型同一 ≠ 取值相同，注意两条不对称：
 //   - StatusOf(err) 可能答出 StatusTimeout（连接没坏，是调用方的控制流），
@@ -155,14 +161,13 @@ func (s Status) Reusable() bool { return s == StatusAlive }
 //	}
 //
 // 两点注意：
-//   - 只比较类别，不比较 unread 修饰位。StatusOf 是「错误 → 类别」的纯函数，
-//     它自己不产生 flagUnread：本包内部的错误类型都不会置位它（只有用户自实现的
-//     Statuser 可能返回带修饰的 Status）。要区分「队列读空的干净结束」与
-//     「还有数据没读完」：
-//     观测侧看 Check / CheckBlocking / CheckReusable / Snapshot 返回的
-//     Status.Unread()（peerState 按当时的 hasPeek 叠加该位）；
-//     错误侧看手上的这个错误本身是否 errors.Is(err, ErrPeerClosedWithUnread)
-//     —— 它由 CloseNotify 给出，描述的是创建该错误时的状态，之后数据可能已被读走；
+//   - 只比较类别，不比较 unread 修饰位。StatusOf 返回的是错误自己声明的 Status：
+//     Check / CheckBlocking / CheckReusable 返回的 *result 会把「检查当时的
+//     unread 位」一并带上，因此 StatusOf(err).Unread() 在错误侧同样可用；
+//     而 CloseNotify 给出的 peerClosedWithUnreadError 不带该位（它描述创建时刻的
+//     状态，之后数据可能已被读走）。要区分「队列读空的干净结束」与「还有数据没读完」：
+//     观测侧看 StatusOf(err).Unread()（Check* 路径）或 Snapshot().Unread()；
+//     错误侧看手上的这个错误本身是否 errors.Is(err, ErrPeerClosedWithUnread)；
 //   - StatusOf(nil) == StatusAlive，因此 StatusAlive.Is(nil) 为 true。
 func (s Status) Is(err error) bool {
 	return StatusOf(err).Class() == s.Class()
@@ -185,6 +190,22 @@ func (s Status) Ended() bool {
 func (s Status) PeerDown() bool {
 	switch s.Class() {
 	case StatusPeerClosed, StatusPeerReset:
+		return true
+	}
+	return false
+}
+
+// Terminal 报告该结论是否意味着「这条连接不能再用了」。
+//
+// 关系（测试会盯着）：Ended() ⊂ Terminal()。
+// 终结但未结束的两个类别是 StatusDataPending（协议失步）与 StatusQuota（配额用尽）
+// ——连接本身可能还活着，但对下一个人已经没有用了。
+//
+// 用 Class() 判：带 unread 修饰的变体（StatusPeerClosedWithUnread 等）
+// 与不带修饰的类别是同一个处置结论。
+func (s Status) Terminal() bool {
+	switch s.Class() {
+	case StatusPeerClosed, StatusPeerReset, StatusLocalClosed, StatusDataPending, StatusQuota:
 		return true
 	}
 	return false
@@ -228,99 +249,133 @@ func (s Status) String() string {
 	return b
 }
 
-// ==================== 纯快照 ====================
+// Statuser 可选接口：错误可以声明自己的结论（分类）。
+//
+// 本包内部的错误类型都实现了它；用户通过 CancelNotify(err) 传入自定义错误时，
+// 也可以实现本接口让 StatusOf 给出准确分类，否则会被归为 StatusUnknown。
+//
+// 注意：内部类型必须实现它——这是 StatusOf 无需猜测错误语义的前提。
+// 新加的错误类型如果没有实现 Statuser，只能在 StatusOf 的 switch 里登记，
+// 否则分类会静默落到 StatusUnknown（status_test.go 的黄金表会盯着）。
+//
+// 实现时只回答「这个错误属于哪一类」，不要在 Status() 里做 I/O、探测或修改连接。
+// StatusOf 可能在日志、指标和每次 Read 错误路径上被调用，必须是纯函数。
+type Statuser interface {
+	Status() Status
+}
 
-// Snapshot 返回连接「已确定的结论」快照：不探测、不落定、不产生通知。
+// StatusOf 返回错误的处置结论，是本包唯一的错误分类入口。
 //
-// 可达集合（除 ResetNotify 外只增不减，因此过期是安全的）：
+// 只有两份映射，顺序不可颠倒：
+//  1. 先问错误自己（内部类型都实现 Statuser：零猜测、零字符串匹配、可被用户扩展）；
+//  2. 再对标准库/系统错误做集中映射（全包只有这一处）。
 //
-//	StatusLocalClosed / StatusPeerClosed(±WithUnread) / StatusPeerReset(±WithUnread) /
-//	StatusLatched / StatusDataPending / StatusUnverified
+// 为什么不用字符串匹配：错误串是给日志看的，一旦有人改了文案，
+// 分类就会静默失效；errors.Is/As + Status 是结构化契约。
 //
-// 它**不会**返回 StatusAlive：缓存无法证明「对端还活着」，那需要一次探测
-// （Check / CheckBlocking）。这正是本方法安全的原因——过期的「已结束」仍然是真的，
-// 而过期的「存活」可能是假的。
+// # 映射表（权威版本是 status_test.go 里的黄金表）
 //
-// 用途：探测前的快速否定过滤（已知死就不必再花系统调用）、指标、日志，
-// 以及替代 IsPeerClosed 做语义化判断。需要「现在到底怎么样」请用 Check。
+//	StatusAlive        nil
+//	StatusPeerClosed   io.EOF / ErrPeerClosedWithUnread / peerClosedWithUnreadError{} /
+//	                   ErrPeerDown（ResetNotify 被拒：对端已下线，故归本类）
+//	StatusPeerReset    io.ErrUnexpectedEOF / ECONNRESET / EPIPE / ENETUNREACH / 超时类断链
+//	StatusLocalClosed  net.ErrClosed / io.ErrClosedPipe / ErrLocalClosed
+//	StatusDataPending  ErrDataPending
+//	StatusBusy         ErrBusy
+//	StatusLatched      ErrNotifyLatched / ErrNotifyCanceled / context.Canceled
+//	StatusUnverified   ErrUnverified
+//	StatusQuota        ErrQuota
+//	StatusTimeout      os.ErrDeadlineExceeded / context.DeadlineExceeded / net.Error.Timeout()
+//	StatusInUse       ErrInUse
+//	StatusUnsupported  ErrUnsupported
+//	StatusUnknown      ErrNotReusable 裸用 / 自定义错误
 //
-//	if c.Snapshot().Ended() {       // 已知死：省掉一次探测
-//		return pool.Drop
+// 表里每一行的哨兵，名字都带着所属类别的状态词（ErrBusy → StatusBusy），
+// 所以「读名字猜类别」与实际分类一致；该契约由 status_test.go 的 errNamingTable
+// 守着（Status.String() 的词干必须出现在名字里，或显式标注豁免理由）。
+//
+// 只想判「是否属于某类别」时用 Status.Is(err)，它等价于本函数的 Class() 比较：
+//
+//	if vconn.StatusBusy.Is(err) {
+//		backoff()
+//		continue
 //	}
-//	if st, err := c.Check(); !st.Readable() { ... }
 //
-// 方法名既不叫 State()（随类型 State 一起并入 Status），也不叫 Status()
-// ——后者会和 Statuser（错误自己声明分类的接口：Status() Status）撞名，
-// 让 *Conn 意外实现该接口。Snapshot 描述的就是它真正做的事：取快照。
-func (c *Conn) Snapshot() Status {
-	if c.closed.Load() || c.rawUsed.Load() {
-		return StatusLocalClosed
-	}
-
-	c.mu.Lock()
-	down, notified, cerr := c.peerDown, c.notified.Load(), c.closeErr
-	c.mu.Unlock()
-
-	if down {
-		// 锁外取读，避免 c.mu → peekMu 的嵌套（虽然当前锁序安全，但不必制造约束）
-		return peerState(cerr, c.r.hasPeek())
-	}
-	if notified {
-		// CancelNotify / WithContext 取消：连接未必坏，但通知已落定。
-		return StatusLatched
-	}
-	if c.r.hasPeek() {
-		return StatusDataPending
-	}
-	return StatusUnverified
-}
-
-// ==================== 分类核心 ====================
-
-// isCleanPeerClose 判断探测给出的结束原因是否为「干净的 FIN」。
+// 与 Check* 的关系（status_test.go 里的不变量测试）：
+// Check* 只返回一个 error，结论由 *result 的 Status() 声明，本函数优先取用它，
+// 因此 StatusOf(err).Class() 恒等于 Check* 给出的类别 —— 两轴不会漂移。
+// 「原因无法归类」的例外只存在于 Cause() 轴：对端确实结束了、但原因归不进任何
+// 类别时，Check* 保守报 StatusPeerReset，而 StatusOf(cause) 如实报 StatusUnknown
+// （cause 不是 *result，没有结论可以覆盖它）。
 //
-// 这是全包唯一判定「干净 FIN」的地方，三处依赖它，判定必须只有一份：
-//   - probePeekAware：只有干净 FIN 才允许把 probeClosed 升级为 probeReadableHangup；
-//   - peerState（下方）：干净 FIN → StatusPeerClosed，否则 StatusPeerReset；
-//   - StatusOf（kind.go）：异常原因必须归到 StatusPeerReset，而不是 StatusPeerClosed。
-//
-// 判定规则 = StatusOf 判为「对端正常结束」**且**不带真实 cause：
-// 带 cause 的哨兵（peerClosedWithUnreadError{cause: ECONNRESET}）虽然 Unwrap 里含
-// io.EOF，但真实原因可能是 RST，抹成「正常收尾」会让上层对非幂等请求做出错误推断。
-func isCleanPeerClose(err error) bool {
+// *result 走「先问错误自己」这条分支，因此 StatusOf 的结果可能带 flagUnread ——
+// 这是唯一会产生 unread 位的错误类型，其它哨兵保持不带位。
+func StatusOf(err error) Status {
 	if err == nil {
-		return true
+		return StatusAlive
 	}
-	if StatusOf(err).Class() != StatusPeerClosed {
-		return false
-	}
-	var causer interface{ Cause() error }
-	if errors.As(err, &causer) && causer.Cause() != nil {
-		return false
-	}
-	return true
-}
 
-// peerState 把「对端结束」的原因归类为干净 FIN（StatusPeerClosed）或异常中断（StatusPeerReset），
-// 并叠加 unread 修饰位。
-//
-// 分类不在这里做第二遍：类别取自 StatusOf（唯一映射表），本函数只做两件事——
-//
-//  1. 把类别**收窄**到「对端结束」这两个值。原因无法归类（StatusUnknown：
-//     自定义错误、平台未收录的 errno）时保守报 StatusPeerReset ——
-//     「对端已经没了，但为什么不知道」按异常处理，绝不上报 StatusPeerClosed
-//     让上层误以为请求已执行完；
-//  2. 叠加 unread 位（数据可能在内核队列，也可能在 vconn 的预读缓冲）。
-func peerState(err error, unread bool) Status {
-	st := StatusOf(err).Class()
-	switch st {
-	case StatusPeerClosed, StatusPeerReset:
-		// 保持 StatusOf 的判定
-	default:
-		st = StatusPeerReset
+	var s Statuser
+	if errors.As(err, &s) {
+		return s.Status()
 	}
-	if unread {
-		st |= flagUnread
+
+	switch {
+	// 配额耗尽要先于 io.EOF 判定：它是「调用方自己设的上限」，不是对端关闭。
+	case errors.Is(err, ErrQuota):
+		return StatusQuota
+
+	// 流在中途被截断：对端没有正常收尾，不能算 StatusPeerClosed。
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return StatusPeerReset
+
+	// 对端正常结束（含 unread 变体）。
+	case errors.Is(err, ErrPeerClosedWithUnread), errors.Is(err, io.EOF):
+		return StatusPeerClosed
+
+	// 本地已关闭（含管道：net.Pipe 本地端关闭时 Read/SetReadDeadline 返回 io.ErrClosedPipe）。
+	case errors.Is(err, net.ErrClosed), errors.Is(err, io.ErrClosedPipe), errors.Is(err, ErrLocalClosed):
+		return StatusLocalClosed
+
+	case errors.Is(err, ErrDataPending):
+		return StatusDataPending
+
+	case errors.Is(err, ErrBusy):
+		return StatusBusy
+
+	case errors.Is(err, ErrNotifyLatched), errors.Is(err, ErrNotifyCanceled), errors.Is(err, context.Canceled):
+		// 上下文取消走的是"手动通知"路径：连接本身未必坏，
+		// 只是这一轮等待被撤销了（需要 ResetNotify 才能重新武装）。
+		return StatusLatched
+
+	case errors.Is(err, ErrUnverified):
+		return StatusUnverified
+
+	case errors.Is(err, ErrInUse):
+		return StatusInUse
+
+	case errors.Is(err, ErrUnsupported):
+		return StatusUnsupported
+
+	case errors.Is(err, ErrPeerDown):
+		// 重置被拒是因为「已经探测到对端下线」：真实状态是对端结束，
+		// 只是这一轮通知不能重新武装。
+		return StatusPeerClosed
+
+	case errors.Is(err, os.ErrDeadlineExceeded), errors.Is(err, context.DeadlineExceeded):
+		return StatusTimeout
 	}
-	return st
+
+	// 底层超时（含自定义 net.Conn 返回的 timeout 错误）：属于调用方的控制流。
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return StatusTimeout
+	}
+
+	// 系统级网络断开错误码（复用 isCommonNetError 的平台白名单，避免各平台漂移）。
+	if isCommonNetError(err) {
+		return StatusPeerReset
+	}
+
+	return StatusUnknown
 }
